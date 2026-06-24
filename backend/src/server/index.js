@@ -16,6 +16,8 @@ const host = args.get("--host") ?? "127.0.0.1";
 const port = Number(args.get("--port") ?? "3001");
 const activeRuns = new Map();
 const eventClients = new Map();
+const pendingApprovals = new Map();
+const alwaysApprovedToolKeys = new Set();
 
 function readArgs(argv) {
   const result = new Map();
@@ -161,6 +163,154 @@ function writeSseEvent(res, event) {
   const data = JSON.stringify(event);
   res.write(`event: agent_event\ndata: ${data}\n\n`);
 }
+function approvalAlwaysKey(threadId, toolName) {
+  return `${threadId}:${toolName ?? "tool"}`;
+}
+
+function approvalIdFor(request) {
+  return String(
+    request.approvalId ??
+      request.toolUse?.id ??
+      `approval_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+  );
+}
+
+function approvalRequestSummary(record) {
+  const request = record.request;
+  return {
+    approvalId: record.approvalId,
+    threadId: record.threadId,
+    runId: record.runId,
+    toolUseId: request.toolUse?.id,
+    toolName: request.toolName,
+    safety: request.safety,
+    approvalPolicy: request.approvalPolicy,
+    approvalsReviewer: request.approvalsReviewer,
+    sandboxMode: request.sandboxMode,
+    risk: request.risk,
+    reason: request.reason,
+    input: request.toolUse?.input,
+    createdAtMs: record.createdAtMs,
+  };
+}
+
+function pendingApprovalToJson(record) {
+  const request = approvalRequestSummary(record);
+  return {
+    ...request,
+    id: record.approvalId,
+    status: record.status,
+    request,
+  };
+}
+
+function approvalEvent(type, record, extra = {}) {
+  const request = approvalRequestSummary(record);
+  return {
+    type,
+    id: `${type}_${record.approvalId}_${Date.now()}`,
+    approvalId: record.approvalId,
+    threadId: record.threadId,
+    runId: record.runId,
+    createdAtMs: Date.now(),
+    toolUseId: request.toolUseId,
+    toolName: request.toolName,
+    safety: request.safety,
+    approvalPolicy: request.approvalPolicy,
+    approvalsReviewer: request.approvalsReviewer,
+    sandboxMode: request.sandboxMode,
+    risk: request.risk,
+    reason: request.reason,
+    request,
+    ...extra,
+  };
+}
+
+function normalizeApprovalDecisionValue(value) {
+  if (value === "approve_once" || value === "approve_always" || value === "reject") {
+    return value;
+  }
+  return "reject";
+}
+
+function waitForToolApproval({ threadId, getRunId, request }) {
+  const approvalId = approvalIdFor(request);
+  const normalizedRequest = { ...request, approvalId };
+  const alwaysKey = approvalAlwaysKey(threadId, normalizedRequest.toolName);
+
+  if (alwaysApprovedToolKeys.has(alwaysKey)) {
+    return {
+      approved: true,
+      reason: `Approved ${normalizedRequest.toolName} by this session approval rule.`,
+    };
+  }
+
+  return new Promise((resolve) => {
+    const record = {
+      approvalId,
+      threadId,
+      runId: getRunId(),
+      request: normalizedRequest,
+      resolve,
+      status: "pending",
+      createdAtMs: Date.now(),
+    };
+    pendingApprovals.set(approvalId, record);
+    broadcast(threadId, approvalEvent("approval_pending", record));
+  });
+}
+
+function answerApproval(approvalId, rawDecision) {
+  const decision = normalizeApprovalDecisionValue(rawDecision);
+  const record = pendingApprovals.get(approvalId);
+
+  if (!record) {
+    return undefined;
+  }
+
+  pendingApprovals.delete(approvalId);
+  record.status = decision === "reject" ? "rejected" : "approved";
+
+  if (decision === "approve_always") {
+    alwaysApprovedToolKeys.add(approvalAlwaysKey(record.threadId, record.request.toolName));
+  }
+
+  const approved = decision !== "reject";
+  const reason = approved
+    ? decision === "approve_always"
+      ? `Approved ${record.request.toolName} for this session.`
+      : `Approved ${record.request.toolName} once.`
+    : `Rejected ${record.request.toolName}.`;
+
+  record.resolve({ approved, reason });
+  broadcast(
+    record.threadId,
+    approvalEvent("approval_answered", record, {
+      decision,
+      approved,
+      reason,
+    }),
+  );
+
+  return { ok: true, approvalId, decision, approved };
+}
+
+function clearRunApprovals(runId, reason = "Run ended before approval was answered.") {
+  for (const [approvalId, record] of [...pendingApprovals.entries()]) {
+    if (record.runId !== runId) continue;
+    pendingApprovals.delete(approvalId);
+    record.status = "rejected";
+    record.resolve({ approved: false, reason });
+    broadcast(
+      record.threadId,
+      approvalEvent("approval_answered", record, {
+        decision: "reject",
+        approved: false,
+        reason,
+      }),
+    );
+  }
+}
 
 async function listWorkspace() {
   const store = new LocalThreadStore(workspaceRoot);
@@ -241,6 +391,12 @@ async function startChatRun(input) {
     config,
     maxToolRounds: 4,
     maxTokens: 16_384,
+    requestToolApproval: (request) =>
+      waitForToolApproval({
+        threadId,
+        getRunId: () => runId,
+        request,
+      }),
     onEvent: (event) => {
       if (event.type === "run_started" && typeof event.runId === "string") {
         runId = event.runId;
@@ -272,7 +428,10 @@ async function startChatRun(input) {
       });
     })
     .finally(() => {
-      if (runId) activeRuns.delete(runId);
+      if (runId) {
+        clearRunApprovals(runId);
+        activeRuns.delete(runId);
+      }
     });
 
   void runPromise;
@@ -294,6 +453,7 @@ function stopRun(runId) {
     runId,
     message: "Stopped by user.",
   });
+  clearRunApprovals(runId, "Stopped by user.");
   activeRuns.delete(runId);
   return true;
 }
@@ -328,7 +488,20 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && pathname === "/api/mission-control/approvals") {
-    sendJson(res, 200, { pending: [] });
+    sendJson(res, 200, { pending: [...pendingApprovals.values()].map(pendingApprovalToJson) });
+    return;
+  }
+
+  const approvalMatch = pathname.match(/^\/api\/approval\/([^/]+)$/);
+  if (req.method === "POST" && approvalMatch) {
+    const body = await readJson(req);
+    const approvalId = decodeURIComponent(approvalMatch[1]);
+    const result = answerApproval(approvalId, body.decision);
+    sendJson(
+      res,
+      result ? 200 : 404,
+      result ?? { ok: false, approvalId, error: "Approval request is no longer pending." },
+    );
     return;
   }
 

@@ -713,43 +713,50 @@ export async function sendConversationMessage(input: SendMessageInput): Promise<
 }
 
 function approvalRequestFields(approvalMode?: string) {
-  const mode = approvalMode?.trim()
+  const mode = approvalMode?.trim() ?? ''
+  const normalized = mode.toLowerCase()
 
-  switch (mode) {
-    case '鏇挎垜瀹℃壒':
-    case 'auto_review':
-    case 'auto-review':
-    case 'auto-approve':
-      return {
-        approvalMode: 'auto_review',
-        approvalPolicy: 'on-request',
-        approvalsReviewer: 'auto_review',
-        sandboxMode: 'workspace-write',
-      }
-    case '瀹屽叏璁块棶鏉冮檺':
-    case 'full_access':
-    case 'full-access':
-    case 'danger-full-access':
-      return {
-        approvalMode: 'full_access',
-        approvalPolicy: 'never',
-        approvalsReviewer: 'user',
-        sandboxMode: 'danger-full-access',
-      }
-    case '璇锋眰鎵瑰噯':
-    case 'request_approval':
-    case 'request-approval':
-    case 'ask-for-approval':
-    default:
-      return {
-        approvalMode: 'request_approval',
-        approvalPolicy: 'on-request',
-        approvalsReviewer: 'user',
-        sandboxMode: 'workspace-write',
-      }
+  if (
+    normalized === 'auto_review' ||
+    normalized === 'auto-review' ||
+    normalized === 'auto-approve' ||
+    mode.includes('替我') ||
+    mode.includes('鏇挎垜')
+  ) {
+    return {
+      approvalMode: 'auto_review',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'auto_review',
+      sandboxMode: 'workspace-write',
+    }
+  }
+
+  if (
+    normalized === 'full_access' ||
+    normalized === 'full-access' ||
+    normalized === 'danger-full-access' ||
+    normalized.includes('full') ||
+    normalized.includes('danger') ||
+    mode.includes('完全') ||
+    mode.includes('访问') ||
+    mode.includes('瀹屽叏') ||
+    mode.includes('璁块棶')
+  ) {
+    return {
+      approvalMode: 'full_access',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandboxMode: 'danger-full-access',
+    }
+  }
+
+  return {
+    approvalMode: 'request_approval',
+    approvalPolicy: 'on-request',
+    approvalsReviewer: 'user',
+    sandboxMode: 'workspace-write',
   }
 }
-
 export function streamRun(
   threadId: string,
   runId: string | undefined,

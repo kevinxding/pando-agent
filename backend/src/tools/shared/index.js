@@ -54,12 +54,17 @@ export function optionalNonNegativeInteger(input, key, fallback) {
 export function resolveWorkspacePath(context, requestedPath) {
     const cwd = resolve(context.cwd);
     const absolutePath = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(cwd, requestedPath);
-    assertInsideWorkspace(cwd, absolutePath);
+    if (!hasDangerFullAccess(context)) {
+        assertInsideWorkspace(cwd, absolutePath);
+    }
     return {
         requestedPath,
         absolutePath,
         relativePath: toPortablePath(relative(cwd, absolutePath) || '.'),
     };
+}
+function hasDangerFullAccess(context) {
+    return context.permissions?.sandboxMode === 'danger-full-access' || context.approvedExternalAccess === true;
 }
 export function resolveWorkspaceCwd(context, requestedCwd) {
     return resolveWorkspacePath(context, requestedCwd ?? '.');

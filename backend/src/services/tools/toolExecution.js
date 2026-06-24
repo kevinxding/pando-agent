@@ -49,7 +49,10 @@ export async function* runToolUse(toolUse, registry, context) {
             yield normalized;
             return;
         }
-        const result = await tool.execute(toolUse, context);
+        const executionContext = permission.source === 'user'
+            ? { ...context, approvedExternalAccess: true }
+            : context;
+        const result = await tool.execute(toolUse, executionContext);
         if (isAsyncIterable(result)) {
             let yielded = false;
             let lastResult;

@@ -107,6 +107,7 @@ async function emitApprovalRequested(context, request) {
     await emitAgentEvent(context, {
         ...eventBase(context, 'approval_requested'),
         type: 'approval_requested',
+        approvalId: request.approvalId,
         toolUseId: request.toolUse.id,
         toolName: request.toolName,
         safety: request.safety,
@@ -122,6 +123,7 @@ async function emitApprovalCompleted(context, request, approved, reviewer, reaso
     await emitAgentEvent(context, {
         ...eventBase(context, 'approval_completed'),
         type: 'approval_completed',
+        approvalId: request.approvalId,
         toolUseId: request.toolUse.id,
         toolName: request.toolName,
         approved,
@@ -162,6 +164,7 @@ function isTrustedTool(tool, permissions) {
 }
 function buildApprovalRequest(tool, toolUse, permissions) {
     return {
+        approvalId: toolUse.id,
         toolUse,
         toolName: tool.name,
         safety: tool.safety,
