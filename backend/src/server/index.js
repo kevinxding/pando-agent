@@ -3,12 +3,14 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { QueryEngine } from "../../backend/src/QueryEngine.js";
-import { loadProjectConfig } from "../../backend/src/services/config/index.js";
-import { LocalThreadStore } from "../../backend/src/services/threadStore/index.js";
+import { QueryEngine } from "../QueryEngine.js";
+import { loadProjectConfig } from "../services/config/index.js";
+import { LocalThreadStore } from "../services/threadStore/index.js";
 
-const clientRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const workspaceRoot = path.resolve(clientRoot, "..");
+const backendSrcRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const backendRoot = path.resolve(backendSrcRoot, "..");
+const workspaceRoot = path.resolve(backendRoot, "..");
+const frontendRoot = path.join(workspaceRoot, "frontend");
 const args = readArgs(process.argv.slice(2));
 const host = args.get("--host") ?? "127.0.0.1";
 const port = Number(args.get("--port") ?? "3001");
@@ -34,7 +36,7 @@ async function readFileIfExists(filePath) {
 async function loadConfig(modelId, body = {}) {
   const projectConfig =
     (await loadProjectConfig(workspaceRoot, readFileIfExists)) ??
-    (await loadProjectConfig(clientRoot, readFileIfExists));
+    (await loadProjectConfig(frontendRoot, readFileIfExists));
   const config = projectConfig?.config ?? {};
   const model = {
     ...(config.model ?? {}),
@@ -406,4 +408,3 @@ server.listen(port, host, () => {
   console.log(`Pando dev API listening on http://${host}:${port}`);
   console.log(`Workspace: ${workspaceRoot}`);
 });
-

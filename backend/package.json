@@ -1,0 +1,10 @@
+{
+  "name": "@pando-agent/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server/index.js --host 127.0.0.1 --port 3001",
+    "check": "node --check src/server/index.js"
+  }
+}

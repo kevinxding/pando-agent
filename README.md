@@ -4,8 +4,9 @@ Pando Agent is a combined frontend and backend workspace for the PandoShare agen
 
 ## Structure
 
-- `frontend/` - React/Vite Web UI and local dev API launcher.
-- `backend/` - Agent runtime source used by the local dev API.
+- `frontend/` - React/Vite Web UI. It talks to the backend over HTTP only.
+- `backend/` - Agent runtime source and local HTTP API service.
+- `.pandoshare/` - Local runtime state written by the backend. This directory is ignored by Git.
 
 ## Local Development
 
@@ -15,7 +16,7 @@ Install frontend dependencies:
 npm --prefix frontend install
 ```
 
-Start the Web UI and local API together:
+Start the Web UI and backend API together:
 
 ```powershell
 npm run dev
@@ -27,10 +28,18 @@ Open:
 http://127.0.0.1:8765/
 ```
 
-The local API listens on:
+The backend API listens on:
 
 ```text
 http://127.0.0.1:3001/
+```
+
+Useful focused commands:
+
+```powershell
+npm run dev:backend
+npm run dev:frontend
+npm run check
 ```
 
 ## Notes

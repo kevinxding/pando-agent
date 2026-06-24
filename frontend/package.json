@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/start-dev.mjs",
-    "dev:api": "node scripts/dev-api-server.mjs --host 127.0.0.1 --port 3001",
+    "dev:api": "npm --prefix ../backend run dev",
     "dev:ui": "vite --host 127.0.0.1 --port 8765 --strictPort",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
