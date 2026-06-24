@@ -1,0 +1,13 @@
+{
+  "name": "pando-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "dev:api": "npm --prefix frontend run dev:api",
+    "dev:ui": "npm --prefix frontend run dev:ui",
+    "build": "npm --prefix frontend run build",
+    "lint": "npm --prefix frontend run lint"
+  }
+}

@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+frontend/node_modules/
+
+# build output
+frontend/dist/
+dist/
+
+# local environment
+.env
+.env.*
+!.env.example
+frontend/.env.local
+
+# runtime state
+.pandoshare/
+outputs/
+
+# local tooling and logs
+.playwright-cli/
+frontend/.playwright-cli/
+*.log
+*.err.log
+*.out.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
