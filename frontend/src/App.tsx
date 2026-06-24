@@ -294,39 +294,11 @@ const settingsGroups = [
   },
 ]
 
-const initialPinnedItems: PinnedItem[] = [
-  { id: 'project:项目 A', kind: 'project', sourceName: '项目 A', label: '置顶项目 A' },
-  { id: 'chat:会话 A', kind: 'chat', sourceName: '会话 A', label: '置顶会话 A' },
-  { id: 'project:项目 B', kind: 'project', sourceName: '项目 B', label: '置顶项目 B' },
-]
+const initialPinnedItems: PinnedItem[] = []
 
-const projects: Project[] = [
-  {
-    name: '项目 A',
-    chats: [
-      { name: '会话 A1', pinned: true },
-      { name: '会话 A2', pinned: false },
-      { name: '会话 A3', pinned: false },
-    ],
-  },
-  {
-    name: '项目 B',
-    chats: [
-      { name: '会话 B1', pinned: true },
-      { name: '会话 B2', pinned: false },
-    ],
-  },
-  {
-    name: '项目 C',
-    chats: [
-      { name: '会话 C1', pinned: false },
-      { name: '会话 C2', pinned: false },
-    ],
-  },
-]
+const projects: Project[] = []
 
-const chats = ['会话 A', '会话 B', '会话 C']
-
+const chats: string[] = []
 type AttachActionItem = NavItem & { id?: 'goal' | 'file' | 'folder' }
 
 const attachActions: AttachActionItem[] = [
