@@ -916,47 +916,55 @@ function LeftSidebar({
   useEffect(() => {
     let active = true
 
-    void loadWorkspaceSnapshot().then((snapshot) => {
-      if (!active || !snapshot) {
-        return
-      }
+    const refreshWorkspace = () => {
+      void loadWorkspaceSnapshot()
+        .then((snapshot) => {
+          if (!active || !snapshot) {
+            return
+          }
 
-      if (snapshot.projects && snapshot.projects.length > 0) {
-        setProjectItems(
-          snapshot.projects.map((project) => ({
-            id: project.id,
-            name: project.name,
-            chats: project.chats.map((chat) => ({
-              id: chat.id,
-              name: chat.name,
-              pinned: Boolean(chat.pinned),
-            })),
-          })),
-        )
-      }
+          if (snapshot.projects) {
+            setProjectItems(
+              snapshot.projects.map((project) => ({
+                id: project.id,
+                name: project.name,
+                chats: project.chats.map((chat) => ({
+                  id: chat.id,
+                  name: chat.name,
+                  pinned: Boolean(chat.pinned),
+                })),
+              })),
+            )
+          }
 
-      if (snapshot.chats && snapshot.chats.length > 0) {
-        setChatItems(snapshot.chats.map((chat) => chat.name))
-        setGlobalChatIds(
-          Object.fromEntries(snapshot.chats.filter((chat) => chat.id).map((chat) => [chat.name, chat.id as string])),
-        )
-      }
+          if (snapshot.chats) {
+            setChatItems(snapshot.chats.map((chat) => chat.name))
+            setGlobalChatIds(
+              Object.fromEntries(snapshot.chats.filter((chat) => chat.id).map((chat) => [chat.name, chat.id as string])),
+            )
+          }
 
-      if (snapshot.pinnedItems && snapshot.pinnedItems.length > 0) {
-        setPinnedItemsState(
-          snapshot.pinnedItems.map((item) => ({
-            id: item.id,
-            kind: item.kind,
-            sourceId: item.sourceId,
-            sourceName: item.sourceName,
-            label: item.label,
-          })),
-        )
-      }
-    })
+          if (snapshot.pinnedItems) {
+            setPinnedItemsState(
+              snapshot.pinnedItems.map((item) => ({
+                id: item.id,
+                kind: item.kind,
+                sourceId: item.sourceId,
+                sourceName: item.sourceName,
+                label: item.label,
+              })),
+            )
+          }
+        })
+        .catch(() => undefined)
+    }
+
+    refreshWorkspace()
+    window.addEventListener('pando:workspace-updated', refreshWorkspace)
 
     return () => {
       active = false
+      window.removeEventListener('pando:workspace-updated', refreshWorkspace)
     }
   }, [])
 
@@ -3472,7 +3480,7 @@ function Composer({
   )
 }
 
-function MainChat({ activeChat }: { activeChat: ActiveChat }) {
+function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; onChatTitleUpdate?: (chatId: string, threadId: string, title: string) => void }) {
   const [messagesByChat, setMessagesByChat] = useState<Record<string, ChatMessage[]>>({})
   const [conversationIdsByChat, setConversationIdsByChat] = useState<Record<string, string>>({})
   const [attachedGoal, setAttachedGoal] = useState<AttachedGoal | null>(null)
@@ -3777,6 +3785,18 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
 
     const type = getAgentRunEventType(event)
 
+    if (type === 'thread_title_updated') {
+      const threadId = agentEventString(event, 'threadId')
+      const title = agentEventString(event, 'title')
+
+      if (threadId && title) {
+        onChatTitleUpdate?.(activeChat.id, threadId, title)
+        window.dispatchEvent(new CustomEvent('pando:workspace-updated'))
+      }
+
+      return
+    }
+
     if (type === 'approval_pending' || type === 'approval_requested') {
       const approval = normalizePendingApproval(event)
       if (!approval) {
@@ -3971,6 +3991,24 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
     setAttachedGoal(null)
   }
 
+  const refreshActiveChatTitle = (threadId?: string) => {
+    if (!threadId) {
+      return
+    }
+
+    void loadWorkspaceSnapshot()
+      .then((snapshot) => {
+        const chat = snapshot?.chats?.find((item) => item.id === threadId)
+        if (!chat?.name) {
+          return
+        }
+
+        onChatTitleUpdate?.(activeChat.id, threadId, chat.name)
+        window.dispatchEvent(new CustomEvent('pando:workspace-updated'))
+      })
+      .catch(() => undefined)
+  }
+
   const ensureConversationId = async () => {
     if (activeConversationId) {
       return activeConversationId
@@ -4027,6 +4065,9 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
           return
         }
 
+        const resultThreadId = result.threadId ?? conversationId
+        refreshActiveChatTitle(resultThreadId)
+
         const immediateText = result.assistantMessage?.text ?? result.finalText
 
         if (immediateText && !result.runId) {
@@ -4042,7 +4083,7 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
 
         let sawDelta = false
 
-        streamRun(result.threadId ?? conversationId, result.runId, {
+        streamRun(resultThreadId, result.runId, {
           onDelta: (delta) => {
             sawDelta = true
             enqueueSmoothAssistantText(assistantId, delta)
@@ -4053,12 +4094,14 @@ function MainChat({ activeChat }: { activeChat: ActiveChat }) {
             if (!sawDelta && immediateText) {
               updateAssistantMessage(assistantId, immediateText)
             }
+            refreshActiveChatTitle(resultThreadId)
           },
           onError: () => {
             completeSmoothAssistantText(assistantId)
             if (!sawDelta) {
               updateAssistantMessage(assistantId, immediateText || backendUnavailableReply)
             }
+            refreshActiveChatTitle(resultThreadId)
           },
         })
       } catch {
@@ -4683,7 +4726,7 @@ function App() {
   const [leftWidth, setLeftWidth] = useState(292)
   const [rightWidth, setRightWidth] = useState(292)
   const [rightWidthBeforeExpand, setRightWidthBeforeExpand] = useState(292)
-  const [activeChat, setActiveChat] = useState<ActiveChat>(() => createSidebarActiveChat('\u4f1a\u8bdd A'))
+  const [activeChat, setActiveChat] = useState<ActiveChat>(() => createSidebarActiveChat('\u65b0\u5bf9\u8bdd'))
   const [activeView, setActiveView] = useState<WorkspaceView>('chat')
   const [activeSetting, setActiveSetting] = useState('mcp')
 
@@ -4747,6 +4790,14 @@ function App() {
     setActiveView('chat')
   }
 
+  const handleChatTitleUpdate = (chatId: string, threadId: string, title: string) => {
+    setActiveChat((currentChat) =>
+      currentChat.id === chatId || currentChat.conversationId === threadId
+        ? { ...currentChat, title, conversationId: currentChat.conversationId ?? threadId }
+        : currentChat,
+    )
+  }
+
   const toggleRightCollapsed = () => {
     if (!rightCollapsed) {
       if (rightExpanded) {
@@ -4796,7 +4847,7 @@ function App() {
         <HeartbeatWorkspace />
       ) : (
         <>
-          <MainChat activeChat={activeChat} />
+          <MainChat activeChat={activeChat} onChatTitleUpdate={handleChatTitleUpdate} />
           <ResizeHandle disabled={rightCollapsed} label="Adjust right sidebar width" onPointerDown={startRightResize} />
           <RightTools
             collapsed={rightCollapsed}

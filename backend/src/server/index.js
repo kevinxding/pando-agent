@@ -4,7 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { QueryEngine } from "../QueryEngine.js";
-import { loadProjectConfig } from "../services/config/index.js";
+import { loadProjectConfig, resolveDefaultModel } from "../services/config/index.js";
+import { generateText } from "../services/llm/client.js";
 import { LocalThreadStore } from "../services/threadStore/index.js";
 
 const backendSrcRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -312,6 +313,116 @@ function clearRunApprovals(runId, reason = "Run ended before approval was answer
   }
 }
 
+const TITLE_GENERATOR_SYSTEM = [
+  "You are a title generator. Output only a short conversation title.",
+  "Rules:",
+  "- Use the same language as the user's message.",
+  "- Output a single line, no markdown, no quotes, no explanation.",
+  "- Keep it under 60 characters.",
+  "- Do not mention tools or implementation details.",
+  "- If the input is short, still produce a useful title like Greeting, Quick check-in, or a natural equivalent.",
+].join("\n");
+
+function temporaryTitleFromPrompt(prompt) {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (!normalized) return "New conversation";
+  return normalized.length > 40 ? `${normalized.slice(0, 37)}...` : normalized;
+}
+
+function defaultOrAutoTitle(metadata) {
+  if (metadata.titleSource === "manual") return false;
+  if (metadata.titleSource === "temporary" || metadata.titleSource === "generated") return true;
+  const title = String(metadata.title ?? "").trim();
+  return (
+    !title ||
+    title === "New conversation" ||
+    title.startsWith("New conversation") ||
+    title.startsWith("\u65b0\u5bf9\u8bdd") ||
+    title.startsWith("\u65b0\u4f1a\u8bdd") ||
+    title.startsWith("thread_") ||
+    /^New session - \d{4}-\d{2}-\d{2}T/.test(title)
+  );
+}
+
+async function updateThreadTitleIfAllowed(store, threadId, input) {
+  const metadata = await store.readMetadata(threadId);
+  if (!defaultOrAutoTitle(metadata)) return undefined;
+
+  const title = normalizeGeneratedTitle(input.title, input.fallbackTitle);
+  if (!title) return undefined;
+
+  const nextMetadata = {
+    ...metadata,
+    title,
+    titleSource: input.titleSource,
+    titleUpdatedAtMs: Date.now(),
+    updatedAtMs: Date.now(),
+  };
+  await store.writeMetadata(nextMetadata);
+
+  const event = {
+    type: "thread_title_updated",
+    id: `thread_title_updated_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    threadId,
+    sessionId: nextMetadata.sessionId,
+    createdAtMs: Date.now(),
+    title,
+    titleSource: input.titleSource,
+  };
+  await store.appendEvent(threadId, event).catch(() => undefined);
+  broadcast(threadId, event);
+  return nextMetadata;
+}
+
+function normalizeGeneratedTitle(title, fallbackTitle) {
+  const firstLine = String(title ?? "")
+    .replace(/<think>[\s\S]*?<\/think>\s*/gi, "")
+    .split(/\r?\n|\r/)
+    .map((line) => line.trim().replace(/^['\"“”‘’`]+|['\"“”‘’`]+$/g, ""))
+    .find((line) => line.length > 0);
+  const candidate = firstLine || fallbackTitle;
+  if (!candidate) return undefined;
+  return candidate.length > 100 ? `${candidate.slice(0, 97)}...` : candidate;
+}
+
+async function maybeAutoTitleThread(input) {
+  const { store, threadId, prompt, config } = input;
+  const messages = await store.readMessages(threadId).catch(() => []);
+  const userMessageCount = messages.filter((message) => message.role === "user").length;
+  if (userMessageCount > 0) return;
+
+  const fallbackTitle = temporaryTitleFromPrompt(prompt);
+  await updateThreadTitleIfAllowed(store, threadId, {
+    title: fallbackTitle,
+    fallbackTitle,
+    titleSource: "temporary",
+  });
+
+  void generateThreadTitle({ store, threadId, prompt, config, fallbackTitle });
+}
+
+async function generateThreadTitle(input) {
+  try {
+    const model = resolveDefaultModel(input.config ?? {});
+    const response = await generateText(
+      {
+        model,
+        system: TITLE_GENERATOR_SYSTEM,
+        prompt: `Generate a title for this conversation:\n\n${input.prompt}`,
+        temperature: 0,
+        maxTokens: 80,
+      },
+      { retry: false },
+    );
+    await updateThreadTitleIfAllowed(input.store, input.threadId, {
+      title: response.text,
+      fallbackTitle: input.fallbackTitle,
+      titleSource: "generated",
+    });
+  } catch {
+    // Keep the temporary title if generation fails.
+  }
+}
 async function listWorkspace() {
   const store = new LocalThreadStore(workspaceRoot);
   const summaries = await store.listThreadSummaries({ limit: 50 }).catch(() => []);
@@ -353,6 +464,7 @@ async function ensureThreadRecord(input) {
       threadId: input.threadId,
       sessionId: input.sessionId,
       title: input.title,
+      titleSource: input.titleSource,
       cwd: workspaceRoot,
       permissions: input.permissions,
     });
@@ -371,9 +483,12 @@ async function startChatRun(input) {
   await ensureThreadRecord({
     threadId,
     sessionId,
-    title: prompt.slice(0, 40) || "New conversation",
+    title: temporaryTitleFromPrompt(prompt),
+    titleSource: "temporary",
     permissions: config.permissions,
   });
+  const titleStore = new LocalThreadStore(workspaceRoot);
+  await maybeAutoTitleThread({ store: titleStore, threadId, prompt, config });
 
   let runId;
   let resolveStarted;
@@ -513,6 +628,7 @@ async function handleRequest(req, res) {
       threadId: id,
       sessionId: `web_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       title,
+      titleSource: "placeholder",
     });
     sendJson(res, 200, { id, threadId: id, title, name: title });
     return;

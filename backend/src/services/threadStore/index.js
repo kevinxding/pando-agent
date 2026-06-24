@@ -25,6 +25,8 @@ export class LocalThreadStore {
             threadId,
             sessionId: input.sessionId,
             title: input.title ?? defaultThreadTitle(threadId),
+            titleSource: input.titleSource,
+            titleUpdatedAtMs: input.titleSource ? now : undefined,
             cwd: resolve(input.cwd),
             createdAtMs: now,
             updatedAtMs: now,
@@ -112,6 +114,8 @@ export class LocalThreadStore {
         const nextMetadata = {
             ...metadata,
             title: trimmed,
+            titleSource: 'manual',
+            titleUpdatedAtMs: Date.now(),
             updatedAtMs: Date.now(),
         };
         await this.writeMetadata(nextMetadata);
