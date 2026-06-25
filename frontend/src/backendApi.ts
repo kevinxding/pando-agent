@@ -29,6 +29,37 @@ export type UiModelGroup = {
   models: string[]
 }
 
+export type UiProviderConnection = {
+  id: string
+  name: string
+  description?: string
+  baseURL?: string
+  models: string[]
+  enabled: boolean
+  authType?: string
+  apiKeyEnv?: string[]
+  apiKeySet?: boolean
+  connected?: boolean
+  builtin?: boolean
+  popular?: boolean
+  custom?: boolean
+  requiresBaseURL?: boolean
+  updatedAtMs?: number
+}
+
+export type ProviderConnectionInput = {
+  id: string
+  name?: string
+  description?: string
+  baseURL?: string
+  models?: string[]
+  enabled?: boolean
+  apiKey?: string
+  apiKeyEnv?: string[]
+  custom?: boolean
+  requiresBaseURL?: boolean
+}
+
 export type UiChatMessage = {
   id: number
   role: 'user' | 'assistant'
@@ -366,6 +397,40 @@ const normalizeModels = (value: unknown): UiModelGroup[] | undefined => {
   return groups.length > 0 ? groups : undefined
 }
 
+const normalizeProviderConnection = (value: unknown): UiProviderConnection | undefined => {
+  if (!isRecord(value)) {
+    return undefined
+  }
+
+  const id = asString(value.id)
+  const name = asString(value.name) ?? id
+  const models = asArray(value.models)
+    .map((model) => (typeof model === 'string' ? model.trim() : isRecord(model) ? asString(model.id) ?? asString(model.name) : undefined))
+    .filter((model): model is string => Boolean(model))
+
+  if (!id || !name) {
+    return undefined
+  }
+
+  return {
+    id,
+    name,
+    description: asString(value.description),
+    baseURL: asString(value.baseURL),
+    models,
+    enabled: value.enabled !== false,
+    authType: asString(value.authType),
+    apiKeyEnv: asArray(value.apiKeyEnv).map((item) => (typeof item === 'string' ? item : undefined)).filter(Boolean) as string[],
+    apiKeySet: Boolean(value.apiKeySet),
+    connected: Boolean(value.connected),
+    builtin: Boolean(value.builtin),
+    popular: Boolean(value.popular),
+    custom: Boolean(value.custom),
+    requiresBaseURL: Boolean(value.requiresBaseURL),
+    updatedAtMs: asNumber(value.updatedAtMs),
+  }
+}
+
 const normalizeConversation = (value: unknown): UiConversation | undefined => {
   if (!isRecord(value)) {
     return undefined
@@ -558,6 +623,36 @@ export async function continueThreadGoal(threadId: string): Promise<ContinueGoal
     threadId: asString(data.threadId),
     summary: normalizeGoalSummary(data),
   }
+}
+
+export async function loadProviderConnections(): Promise<UiProviderConnection[] | undefined> {
+  const response = await jsonRequest<unknown>('/api/providers/connections')
+  const data = unwrapData(response)
+  const rows = firstArray(isRecord(data) ? data.providers : undefined, data)
+    .map(normalizeProviderConnection)
+    .filter((provider): provider is UiProviderConnection => Boolean(provider))
+
+  return rows.length > 0 ? rows : undefined
+}
+
+export async function saveProviderConnection(input: ProviderConnectionInput): Promise<UiProviderConnection | undefined> {
+  const response = await jsonRequest<unknown>('/api/providers/connections', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  const data = unwrapData(response)
+  const provider = isRecord(data) && 'provider' in data ? data.provider : data
+
+  return normalizeProviderConnection(provider)
+}
+
+export async function deleteProviderConnection(id: string): Promise<boolean> {
+  const response = await jsonRequest<unknown>(`/api/providers/connections/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+  const data = unwrapData(response)
+
+  return isRecord(data) ? data.ok === true : response !== undefined
 }
 
 export async function loadModelGroups(): Promise<UiModelGroup[] | undefined> {

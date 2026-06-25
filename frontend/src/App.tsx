@@ -70,16 +70,19 @@ import {
   continueThreadGoal,
   createProject,
   createScheduledTask,
+  deleteProviderConnection,
   deleteScheduledTask,
   loadConversationEvents,
   loadConversationMessages,
   loadHeartbeatSnapshot,
   loadModelGroups,
   loadPendingApprovals,
+  loadProviderConnections,
   loadWorkspaceSnapshot,
   pauseScheduledTask,
   runScheduledTask,
   resolveApproval,
+  saveProviderConnection,
   sendConversationMessage,
   setHeartbeatRunning as setHeartbeatRunningBackend,
   setPinnedItem,
@@ -91,6 +94,7 @@ import {
   type ApprovalDecision,
   type HeartbeatTaskInput,
   type UiGoalSummary,
+  type UiProviderConnection,
 } from './backendApi'
 
 type IconType = ComponentType<{ size?: number; strokeWidth?: number }>
@@ -411,12 +415,34 @@ const modelVisibilityKey = (provider: string, model: string) => `${provider}::${
 const modelVisibilityKeys = (groups: ModelGroup[]) =>
   groups.flatMap((group) => group.models.map((model) => modelVisibilityKey(group.provider, model)))
 
-const modelGroups: ModelGroup[] = [
-  { provider: 'DeepSeek\uff08\u6df1\u5ea6\u6c42\u7d22\uff09', models: ['DeepSeek V4 Pro', 'DeepSeek V4 Flash', 'DeepSeek R1'] },
-  { provider: 'MiniMax\uff08\u7a00\u5b87\u79d1\u6280\uff09', models: ['MiniMax M3', 'MiniMax K2.6', 'MiniMax 2.7'] },
-  { provider: 'GLM \u667a\u8c31AI', models: ['GLM 5.15.2', 'GLM-4-Plus', 'GLM 5 Turbo'] },
-  { provider: 'Qwen \u901a\u4e49\u5343\u95ee\uff08\u963f\u91cc\uff09', models: ['Qwen3.7 Max', 'Qwen3.6 Plus', 'Qwen2.5-VL'] },
-]
+const modelGroups: ModelGroup[] = []
+
+const MODEL_SELECTION_STORAGE_KEY = 'pando:selected-model:v1'
+
+const readStoredSelectedModel = () => {
+  if (typeof window === 'undefined') return undefined
+  try {
+    const value = window.localStorage.getItem(MODEL_SELECTION_STORAGE_KEY)?.trim()
+    return value || undefined
+  } catch {
+    return undefined
+  }
+}
+
+const writeStoredSelectedModel = (model: string | undefined) => {
+  if (typeof window === 'undefined') return
+  try {
+    if (model && model !== defaultModelLabel) window.localStorage.setItem(MODEL_SELECTION_STORAGE_KEY, model)
+    else window.localStorage.removeItem(MODEL_SELECTION_STORAGE_KEY)
+  } catch {
+    // Local storage can be unavailable in restricted browser contexts.
+  }
+}
+
+const firstModelFromGroups = (groups: ModelGroup[]) => groups.find((group) => group.models.length > 0)?.models[0]
+const modelExistsInGroups = (groups: ModelGroup[], model: string) =>
+  model !== defaultModelLabel && groups.some((group) => group.models.includes(model))
+
 const backendUnavailableReply = '后端或模型请求失败，请检查 Pando 后端状态后重试。'
 const assistantThinkingText = '正在思考'
 
@@ -1786,31 +1812,189 @@ function ModelManageDialog({
   )
 }
 
-const providerGroups = [
-  {
-    title: '热门',
-    providers: [
-      { name: 'OpenAI', description: '使用 ChatGPT Pro/Plus 或 API 密钥连接', icon: Sparkles },
-      { name: 'Google', description: 'Gemini 模型提供商', icon: Sparkles },
-      { name: 'OpenRouter', description: '统一路由多个模型', icon: ExternalLink },
-      { name: 'Vercel AI Gateway', description: '通过 Vercel 网关连接', icon: PackagePlus },
-    ],
-  },
-  {
-    title: '其他',
-    providers: [
-      { name: '自定义', description: '兼容 OpenAI 风格接口', icon: SlidersHorizontal, tag: '自定义' },
-      { name: '302.AI', description: '第三方模型聚合服务', icon: Bot },
-      { name: 'Abacus', description: '外部模型提供商', icon: Activity },
-      { name: 'abiliteration.ai', description: '外部模型提供商', icon: Sparkles },
-      { name: 'AIHubMix', description: '第三方模型聚合服务', icon: Gauge },
-    ],
-  },
-]
+type ProviderFormState = {
+  id: string
+  name: string
+  baseURL: string
+  apiKey: string
+  apiKeyEnvText: string
+  modelsText: string
+  enabled: boolean
+}
 
-function ProviderConnectDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+const providerIconForId = (id: string): IconType => {
+  if (id.includes('openrouter')) return ExternalLink
+  if (id.includes('vercel')) return PackagePlus
+  if (id.includes('deepseek')) return Sparkles
+  if (id.includes('minimax')) return Bot
+  if (id.includes('google')) return Sparkles
+  if (id.includes('openai')) return Sparkles
+  if (id.includes('custom')) return SlidersHorizontal
+  if (id.includes('302')) return Bot
+  if (id.includes('aihub')) return Gauge
+  return Activity
+}
+
+const splitProviderLines = (value: string) =>
+  value
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+
+const providerFormFromConnection = (provider?: UiProviderConnection): ProviderFormState => ({
+  id: provider?.id ?? 'custom',
+  name: provider?.name ?? 'Custom',
+  baseURL: provider?.baseURL ?? '',
+  apiKey: '',
+  apiKeyEnvText: provider?.apiKeyEnv?.join(', ') ?? '',
+  modelsText: provider?.models?.join('\n') ?? 'custom-model',
+  enabled: provider?.enabled !== false,
+})
+
+const providerMatchesQuery = (provider: UiProviderConnection, query: string) => {
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  if (!normalizedQuery) return true
+
+  return matchesSlashQuery(
+    [provider.name, provider.id, provider.description, provider.baseURL, provider.models.join(' ')].join(' '),
+    normalizedQuery,
+  )
+}
+
+function ProviderConnectDialog({
+  open,
+  onClose,
+  onProvidersChanged,
+}: {
+  open: boolean
+  onClose: () => void
+  onProvidersChanged?: () => void
+}) {
+  const [providers, setProviders] = useState<UiProviderConnection[]>([])
+  const [query, setQuery] = useState('')
+  const [selectedId, setSelectedId] = useState<string | undefined>()
+  const [form, setForm] = useState<ProviderFormState>(() => providerFormFromConnection())
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [status, setStatus] = useState<string | undefined>()
+  const activeProvider = providers.find((provider) => provider.id === selectedId) ?? providers[0]
+
+  useEffect(() => {
+    if (!open) return
+
+    let alive = true
+    setLoading(true)
+    setStatus(undefined)
+    void loadProviderConnections()
+      .then((rows) => {
+        if (!alive) return
+        const nextProviders = rows ?? []
+        setProviders(nextProviders)
+        const nextSelected = selectedId && nextProviders.some((provider) => provider.id === selectedId)
+          ? selectedId
+          : nextProviders[0]?.id
+        setSelectedId(nextSelected)
+        setForm(providerFormFromConnection(nextProviders.find((provider) => provider.id === nextSelected)))
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+
+    return () => {
+      alive = false
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open || !activeProvider) return
+    setForm(providerFormFromConnection(activeProvider))
+    setStatus(undefined)
+  }, [open, activeProvider?.id])
+
   if (typeof document === 'undefined') {
     return null
+  }
+
+  const providerGroupsForView = [
+    {
+      title: '热门',
+      providers: providers.filter((provider) => provider.popular && providerMatchesQuery(provider, query)),
+    },
+    {
+      title: '其他',
+      providers: providers.filter((provider) => !provider.popular && providerMatchesQuery(provider, query)),
+    },
+  ].filter((group) => group.providers.length > 0)
+
+  const updateForm = (key: keyof ProviderFormState, value: string | boolean) => {
+    setForm((current) => ({ ...current, [key]: value }))
+    setStatus(undefined)
+  }
+
+  const reloadProviders = async (selectedProviderId?: string) => {
+    const rows = (await loadProviderConnections()) ?? []
+    setProviders(rows)
+    if (selectedProviderId) {
+      setSelectedId(selectedProviderId)
+      setForm(providerFormFromConnection(rows.find((provider) => provider.id === selectedProviderId)))
+    }
+    onProvidersChanged?.()
+  }
+
+  const saveConnection = async () => {
+    if (saving) return
+    const models = splitProviderLines(form.modelsText)
+    const apiKeyEnv = splitProviderLines(form.apiKeyEnvText)
+
+    if (!form.id.trim() || !form.name.trim()) {
+      setStatus('Provider ID 和显示名称不能为空。')
+      return
+    }
+    if (activeProvider?.requiresBaseURL && !form.baseURL.trim()) {
+      setStatus('这个提供商需要填写 Base URL。')
+      return
+    }
+    if (models.length === 0) {
+      setStatus('至少需要保留一个模型。')
+      return
+    }
+
+    setSaving(true)
+    try {
+      const saved = await saveProviderConnection({
+        id: form.id,
+        name: form.name,
+        baseURL: form.baseURL,
+        models,
+        apiKey: form.apiKey,
+        apiKeyEnv,
+        enabled: form.enabled,
+        custom: activeProvider?.custom,
+        requiresBaseURL: activeProvider?.requiresBaseURL,
+      })
+      if (!saved) {
+        setStatus('保存失败，请检查后端状态。')
+        return
+      }
+      setStatus(saved.connected ? '已保存并连接。' : '已保存，等待 API Key 或环境变量。')
+      await reloadProviders(saved.id)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const disconnectConnection = async () => {
+    if (!activeProvider || saving) return
+    setSaving(true)
+    try {
+      const ok = await deleteProviderConnection(activeProvider.id)
+      setStatus(ok ? '已断开连接。' : '断开失败。')
+      await reloadProviders(activeProvider.id)
+    } finally {
+      setSaving(false)
+    }
   }
 
   return createPortal(
@@ -1826,7 +2010,7 @@ function ProviderConnectDialog({ open, onClose }: { open: boolean; onClose: () =
           onClick={onClose}
         >
           <motion.div
-            className="provider-dialog"
+            className="provider-dialog provider-dialog-real"
             role="dialog"
             aria-modal="true"
             aria-label="连接提供商"
@@ -1839,42 +2023,155 @@ function ProviderConnectDialog({ open, onClose }: { open: boolean; onClose: () =
             <div className="provider-dialog-header">
               <div>
                 <h2>连接提供商</h2>
-                <p>占位界面，后续接入模型配置。</p>
+                <p>管理模型提供商、API Key、Base URL 和可用模型。</p>
               </div>
               <button className="provider-dialog-close" type="button" aria-label="关闭" onClick={onClose}>
                 <X size={16} />
               </button>
             </div>
 
-            <label className="provider-search">
-              <Search size={16} />
-              <input aria-label="搜索提供商" placeholder="搜索提供商" readOnly />
-            </label>
+            <div className="provider-dialog-body">
+              <div className="provider-picker-pane">
+                <label className="provider-search">
+                  <Search size={16} />
+                  <input
+                    aria-label="搜索提供商"
+                    placeholder="搜索提供商"
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                  />
+                </label>
 
-            <div className="provider-list">
-              {providerGroups.map((group) => (
-                <section className="provider-group" key={group.title}>
-                  <h3>{group.title}</h3>
-                  {group.providers.map((provider) => {
-                    const ProviderIcon = provider.icon
+                <div className="provider-list provider-list-real">
+                  {loading ? <div className="provider-empty">正在加载提供商...</div> : null}
+                  {!loading && providerGroupsForView.length === 0 ? <div className="provider-empty">没有匹配的提供商</div> : null}
+                  {providerGroupsForView.map((group) => (
+                    <section className="provider-group" key={group.title}>
+                      <h3>{group.title}</h3>
+                      {group.providers.map((provider) => {
+                        const ProviderIcon = providerIconForId(provider.id)
+                        const selected = activeProvider?.id === provider.id
 
-                    return (
-                      <button className="provider-option" type="button" key={provider.name}>
-                        <span className="provider-option-icon">
-                          <ProviderIcon size={15} />
-                        </span>
-                        <span className="provider-option-copy">
-                          <span className="provider-option-title">
-                            {provider.name}
-                            {provider.tag ? <span className="provider-option-tag">{provider.tag}</span> : null}
-                          </span>
-                          <span className="provider-option-description">{provider.description}</span>
-                        </span>
+                        return (
+                          <button
+                            className={'provider-option ' + (selected ? 'selected' : '')}
+                            type="button"
+                            key={provider.id}
+                            onClick={() => setSelectedId(provider.id)}
+                          >
+                            <span className="provider-option-icon">
+                              <ProviderIcon size={15} />
+                            </span>
+                            <span className="provider-option-copy">
+                              <span className="provider-option-title">
+                                {provider.name}
+                                {provider.custom ? <span className="provider-option-tag">自定义</span> : null}
+                                {provider.connected ? <span className="provider-option-tag connected">已连接</span> : null}
+                              </span>
+                              <span className="provider-option-description">{provider.description}</span>
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </section>
+                  ))}
+                </div>
+              </div>
+
+              <div className="provider-config-pane">
+                {activeProvider ? (
+                  <>
+                    <div className="provider-config-head">
+                      <div className="provider-config-icon" aria-hidden="true">
+                        {(() => {
+                          const ProviderIcon = providerIconForId(activeProvider.id)
+                          return <ProviderIcon size={18} />
+                        })()}
+                      </div>
+                      <div>
+                        <h3>{activeProvider.name}</h3>
+                        <p>{activeProvider.connected ? '\u5f53\u524d\u63d0\u4f9b\u5546\u5df2\u7ecf\u53ef\u7528\u4e8e\u6a21\u578b\u9009\u62e9\u3002' : '\u586b\u5199 API Key \u6216\u73af\u5883\u53d8\u91cf\u540e\u5373\u53ef\u8fde\u63a5\u3002'}</p>
+                      </div>
+                    </div>
+
+                    <div className="provider-status-row">
+                      <span className={'provider-status-pill ' + (activeProvider.connected ? 'connected' : '')}>
+                        {activeProvider.connected ? 'Connected' : 'Not connected'}
+                      </span>
+                      <button
+                        className={'provider-enable-switch ' + (form.enabled ? 'enabled' : '')}
+                        type="button"
+                        role="switch"
+                        aria-checked={form.enabled}
+                        onClick={() => updateForm('enabled', !form.enabled)}
+                      >
+                        <span />
                       </button>
-                    )
-                  })}
-                </section>
-              ))}
+                    </div>
+
+                    <div className="provider-form-grid">
+                      <label className="provider-field">
+                        <span>Provider ID</span>
+                        <input
+                          value={form.id}
+                          readOnly={!activeProvider.custom}
+                          onChange={(event) => updateForm('id', event.target.value)}
+                        />
+                      </label>
+                      <label className="provider-field">
+                        <span>显示名称</span>
+                        <input value={form.name} onChange={(event) => updateForm('name', event.target.value)} />
+                      </label>
+                      <label className="provider-field provider-field-wide">
+                        <span>Base URL</span>
+                        <input
+                          value={form.baseURL}
+                          placeholder="https://api.example.com/v1"
+                          onChange={(event) => updateForm('baseURL', event.target.value)}
+                        />
+                      </label>
+                      <label className="provider-field provider-field-wide">
+                        <span>API Key</span>
+                        <input
+                          type="password"
+                          value={form.apiKey}
+                          placeholder={activeProvider.apiKeySet ? '已保存，留空保持不变' : 'sk-...'}
+                          onChange={(event) => updateForm('apiKey', event.target.value)}
+                        />
+                      </label>
+                      <label className="provider-field provider-field-wide">
+                        <span>环境变量</span>
+                        <input
+                          value={form.apiKeyEnvText}
+                          placeholder="OPENAI_API_KEY"
+                          onChange={(event) => updateForm('apiKeyEnvText', event.target.value)}
+                        />
+                      </label>
+                      <label className="provider-field provider-field-wide">
+                        <span>模型列表</span>
+                        <textarea
+                          value={form.modelsText}
+                          rows={5}
+                          onChange={(event) => updateForm('modelsText', event.target.value)}
+                        />
+                      </label>
+                    </div>
+
+                    {status ? <div className="provider-save-status">{status}</div> : null}
+
+                    <div className="provider-config-actions">
+                      <button className="provider-secondary-action" type="button" onClick={disconnectConnection} disabled={saving}>
+                        断开
+                      </button>
+                      <button className="provider-primary-action" type="button" onClick={saveConnection} disabled={saving}>
+                        {saving ? '保存中...' : '保存连接'}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="provider-empty provider-empty-panel">请选择一个提供商</div>
+                )}
+              </div>
             </div>
           </motion.div>
         </motion.div>
@@ -3105,7 +3402,7 @@ function Composer({
   const [providerDialogOpen, setProviderDialogOpen] = useState(false)
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
   const [modelQuery, setModelQuery] = useState('')
-  const [selectedModel, setSelectedModel] = useState(defaultModelLabel)
+  const [selectedModel, setSelectedModel] = useState(() => readStoredSelectedModel() ?? defaultModelLabel)
   const [availableModelGroups, setAvailableModelGroups] = useState<ModelGroup[]>(modelGroups)
   const [visibleModelKeys, setVisibleModelKeys] = useState<Set<string> | null>(null)
   const [message, setMessage] = useState('')
@@ -3136,12 +3433,33 @@ function Composer({
     }))
     .filter((group) => group.models.length > 0)
 
+  const applyAvailableModelGroups = (groups: ModelGroup[] | undefined) => {
+    const nextGroups = groups ?? []
+
+    setAvailableModelGroups(nextGroups)
+    setSelectedModel((currentModel) => {
+      const storedModel = readStoredSelectedModel()
+      const nextModel = storedModel && modelExistsInGroups(nextGroups, storedModel)
+        ? storedModel
+        : modelExistsInGroups(nextGroups, currentModel)
+          ? currentModel
+          : firstModelFromGroups(nextGroups) ?? defaultModelLabel
+
+      writeStoredSelectedModel(nextModel === defaultModelLabel ? undefined : nextModel)
+      return nextModel
+    })
+  }
+
+  const refreshAvailableModelGroups = () => {
+    void loadModelGroups().then(applyAvailableModelGroups)
+  }
+
   useEffect(() => {
     let active = true
 
     void loadModelGroups().then((groups) => {
-      if (active && groups && groups.length > 0) {
-        setAvailableModelGroups(groups)
+      if (active) {
+        applyAvailableModelGroups(groups)
       }
     })
 
@@ -3250,6 +3568,7 @@ function Composer({
         nextKeys.delete(key)
         if (selectedModel === model) {
           setSelectedModel(defaultModelLabel)
+          writeStoredSelectedModel(undefined)
         }
       } else {
         nextKeys.add(key)
@@ -3309,7 +3628,11 @@ function Composer({
 
   return (
     <div className={'composer-zone ' + (goalVisible ? 'has-goal' : '')}>
-      <ProviderConnectDialog open={providerDialogOpen} onClose={() => setProviderDialogOpen(false)} />
+      <ProviderConnectDialog
+        open={providerDialogOpen}
+        onClose={() => setProviderDialogOpen(false)}
+        onProvidersChanged={refreshAvailableModelGroups}
+      />
       <ModelManageDialog
         open={modelManagerOpen}
         modelGroups={availableModelGroups}
@@ -3489,6 +3812,7 @@ function Composer({
                   onQueryChange={setModelQuery}
                   onSelectModel={(model) => {
                     setSelectedModel(model)
+                    writeStoredSelectedModel(model)
                     setModelQuery('')
                     setModelOpen(false)
                   }}

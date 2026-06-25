@@ -94,12 +94,20 @@ function maybeBuiltinProvider(providerId) {
     }
 }
 function resolveAuthConfig(providerId, config, fallback) {
+    const inlineToken = typeof config.auth?.token === 'string' && config.auth.token.trim()
+        ? config.auth.token.trim()
+        : typeof config.token === 'string' && config.token.trim()
+            ? config.token.trim()
+            : undefined;
     if (!config.auth && !config.apiKeyEnv)
-        return fallback;
+        return inlineToken && fallback?.type === 'api-key'
+            ? { ...fallback, token: inlineToken }
+            : fallback;
     if (!config.auth) {
         return {
             type: 'api-key',
             envKeys: normalizeStringList(config.apiKeyEnv, `providers.${providerId}.apiKeyEnv`),
+            ...(inlineToken ? { token: inlineToken } : {}),
         };
     }
     switch (config.auth.type) {
@@ -109,6 +117,7 @@ function resolveAuthConfig(providerId, config, fallback) {
             return {
                 type: 'api-key',
                 envKeys: normalizeStringList(config.auth.envKeys ?? config.apiKeyEnv, `providers.${providerId}.auth.envKeys`),
+                ...(inlineToken ? { token: inlineToken } : {}),
             };
         case 'codex-access-token':
             return {

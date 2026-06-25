@@ -20,6 +20,7 @@ const workspaceRoot = process.env.PANDO_WORKSPACE_ROOT?.trim()
   ? path.resolve(process.env.PANDO_WORKSPACE_ROOT)
   : defaultWorkspaceRoot;
 const runtimeDataRoot = path.join(workspaceRoot, ".pandoshare");
+const providerConnectionsPath = path.join(runtimeDataRoot, "provider-connections.json");
 const frontendRoot = path.join(workspaceRoot, "frontend");
 const args = readArgs(process.argv.slice(2));
 const host = args.get("--host") ?? "127.0.0.1";
@@ -117,13 +118,23 @@ async function loadConfig(modelId, body = {}) {
     (await loadProjectConfig(workspaceRoot, readFileIfExists)) ??
     (await loadProjectConfig(frontendRoot, readFileIfExists));
   const config = projectConfig?.config ?? {};
+  const connectionRuntime = await loadProviderConnectionRuntimeConfig();
+  const selectedModelName = typeof modelId === "string" && modelId.trim() ? modelId.trim() : undefined;
+  const selectedProviderId = selectedModelName
+    ? findProviderIdForModel(selectedModelName, connectionRuntime.connections)
+    : undefined;
   const model = {
     ...(config.model ?? {}),
-    ...(typeof modelId === "string" && modelId.trim() ? { name: modelId.trim() } : {}),
+    ...(selectedProviderId ? { provider: selectedProviderId } : {}),
+    ...(selectedModelName ? { name: selectedModelName } : {}),
   };
 
   return {
     ...config,
+    providers: {
+      ...(config.providers ?? {}),
+      ...connectionRuntime.providers,
+    },
     model,
     permissions: resolvePermissions(config.permissions ?? {}, body),
   };
@@ -512,6 +523,322 @@ async function generateThreadTitle(input) {
     // Keep the temporary title if generation fails.
   }
 }
+const providerCatalog = [
+  {
+    id: "minimax-cn",
+    name: "MiniMax China Token Plan",
+    description: "MiniMax China API with Token Plan support.",
+    baseURL: "https://api.minimaxi.com/v1",
+    models: ["MiniMax-M3"],
+    apiKeyEnv: ["MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"],
+    builtin: true,
+    popular: true,
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    description: "DeepSeek official API.",
+    baseURL: "https://api.deepseek.com",
+    models: ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"],
+    apiKeyEnv: ["DEEPSEEK_API_KEY"],
+    builtin: true,
+    popular: true,
+  },
+  {
+    id: "openai",
+    name: "OpenAI API",
+    description: "OpenAI API key connection.",
+    baseURL: "https://api.openai.com/v1",
+    models: ["gpt-5.5", "gpt-5", "gpt-4.1"],
+    apiKeyEnv: ["OPENAI_API_KEY"],
+    builtin: true,
+    popular: true,
+  },
+  {
+    id: "google",
+    name: "Google",
+    description: "Gemini model provider.",
+    baseURL: "https://generativelanguage.googleapis.com/v1beta/openai",
+    models: ["gemini-2.5-pro", "gemini-2.5-flash"],
+    apiKeyEnv: ["GOOGLE_GENERATIVE_AI_API_KEY", "GEMINI_API_KEY"],
+    popular: true,
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    description: "Route multiple models through one OpenAI-compatible API.",
+    baseURL: "https://openrouter.ai/api/v1",
+    models: ["openai/gpt-5", "anthropic/claude-sonnet-4.5", "deepseek/deepseek-chat"],
+    apiKeyEnv: ["OPENROUTER_API_KEY"],
+    popular: true,
+  },
+  {
+    id: "vercel-ai-gateway",
+    name: "Vercel AI Gateway",
+    description: "Connect through Vercel AI Gateway.",
+    baseURL: "https://ai-gateway.vercel.sh/v1",
+    models: ["openai/gpt-5", "anthropic/claude-sonnet-4.5"],
+    apiKeyEnv: ["VERCEL_AI_GATEWAY_API_KEY"],
+    popular: true,
+  },
+  {
+    id: "302-ai",
+    name: "302.AI",
+    description: "Third-party OpenAI-compatible model service.",
+    baseURL: "https://api.302.ai/v1",
+    models: ["gpt-4o", "claude-3-5-sonnet"],
+    apiKeyEnv: ["AI302_API_KEY", "API_302_KEY"],
+  },
+  {
+    id: "abacus",
+    name: "Abacus",
+    description: "External model provider.",
+    baseURL: "",
+    models: ["abacus-model"],
+    apiKeyEnv: ["ABACUS_API_KEY"],
+    requiresBaseURL: true,
+  },
+  {
+    id: "aihubmix",
+    name: "AIHubMix",
+    description: "Third-party OpenAI-compatible model service.",
+    baseURL: "https://aihubmix.com/v1",
+    models: ["gpt-4o", "claude-3-5-sonnet"],
+    apiKeyEnv: ["AIHUBMIX_API_KEY"],
+  },
+  {
+    id: "custom",
+    name: "Custom",
+    description: "OpenAI-compatible custom provider.",
+    baseURL: "",
+    models: ["custom-model"],
+    apiKeyEnv: ["CUSTOM_LLM_API_KEY"],
+    custom: true,
+    requiresBaseURL: true,
+  },
+];
+
+function providerCatalogById() {
+  return new Map(providerCatalog.map((provider) => [provider.id, provider]));
+}
+
+function normalizeProviderId(value) {
+  const id = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!id) throw new Error("Provider id is required.");
+  return id;
+}
+
+function normalizeStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function readProviderConnectionRows() {
+  try {
+    const text = await fs.readFile(providerConnectionsPath, "utf8");
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed.connections) ? parsed.connections : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeProviderConnection(input, existing) {
+  const catalog = providerCatalogById();
+  const id = normalizeProviderId(input.id ?? existing?.id);
+  const preset = catalog.get(id);
+  const name = String(input.name ?? existing?.name ?? preset?.name ?? id).trim() || id;
+  const baseURL = String(input.baseURL ?? existing?.baseURL ?? preset?.baseURL ?? "").trim();
+  const apiKey = typeof input.apiKey === "string" && input.apiKey.trim()
+    ? input.apiKey.trim()
+    : existing?.apiKey;
+  const inputEnv = normalizeStringArray(input.apiKeyEnv);
+  const existingEnv = normalizeStringArray(existing?.apiKeyEnv);
+  const inputModels = normalizeStringArray(input.models);
+  const existingModels = normalizeStringArray(existing?.models);
+  const apiKeyEnv = inputEnv.length > 0 ? inputEnv : existingEnv.length > 0 ? existingEnv : [...(preset?.apiKeyEnv ?? [providerEnvKey(id)])];
+  const models = inputModels.length > 0 ? inputModels : existingModels.length > 0 ? existingModels : [...(preset?.models ?? ["custom-model"])];
+  const requiresBaseURL = Boolean(input.requiresBaseURL ?? existing?.requiresBaseURL ?? preset?.requiresBaseURL);
+  return {
+    id,
+    name,
+    description: String(input.description ?? existing?.description ?? preset?.description ?? "OpenAI-compatible provider.").trim(),
+    baseURL,
+    models,
+    enabled: input.enabled === undefined ? existing?.enabled !== false : input.enabled !== false,
+    authType: "api-key",
+    apiKey,
+    apiKeyEnv,
+    builtin: Boolean(preset?.builtin),
+    popular: Boolean(input.popular ?? existing?.popular ?? preset?.popular),
+    custom: Boolean(input.custom ?? existing?.custom ?? preset?.custom),
+    requiresBaseURL,
+    updatedAtMs: Date.now(),
+  };
+}
+
+function providerEnvKey(id) {
+  return `${id.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+}
+
+async function readProviderConnections() {
+  const saved = new Map();
+  for (const row of await readProviderConnectionRows()) {
+    if (!row || typeof row !== "object") continue;
+    try {
+      const normalized = normalizeProviderConnection(row);
+      saved.set(normalized.id, normalized);
+    } catch {
+      // Ignore malformed local rows instead of breaking the app boot path.
+    }
+  }
+  const merged = providerCatalog.map((provider) => normalizeProviderConnection(saved.get(provider.id) ?? provider));
+  for (const [id, connection] of saved) {
+    if (!providerCatalog.some((provider) => provider.id === id)) merged.push(connection);
+  }
+  return merged;
+}
+
+async function writeProviderConnections(connections) {
+  await fs.mkdir(runtimeDataRoot, { recursive: true });
+  const rows = connections
+    .filter(isProviderConnectionPersistable)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  await fs.writeFile(
+    providerConnectionsPath,
+    JSON.stringify({ version: 1, updatedAtMs: Date.now(), connections: rows }, null, 2),
+    "utf8",
+  );
+}
+
+function providerHasAuth(connection) {
+  return Boolean(connection.apiKey) || Boolean(connection.apiKeyEnv?.some((key) => Boolean(process.env[key])));
+}
+
+function providerHasUsableEndpoint(connection) {
+  return !connection.requiresBaseURL || Boolean(connection.baseURL);
+}
+
+function isProviderConnected(connection) {
+  return connection.enabled !== false && providerHasAuth(connection) && providerHasUsableEndpoint(connection);
+}
+
+function sameStringArray(left, right) {
+  const a = normalizeStringArray(left);
+  const b = normalizeStringArray(right);
+  return a.length === b.length && a.every((item, index) => item === b[index]);
+}
+
+function isCatalogEquivalentConnection(connection) {
+  const preset = providerCatalogById().get(connection.id);
+  if (!preset) return false;
+  return (
+    connection.name === preset.name &&
+    connection.description === preset.description &&
+    connection.baseURL === preset.baseURL &&
+    connection.enabled !== false &&
+    !connection.apiKey &&
+    sameStringArray(connection.apiKeyEnv, preset.apiKeyEnv) &&
+    sameStringArray(connection.models, preset.models)
+  );
+}
+
+function isProviderConnectionPersistable(connection) {
+  if (connection.enabled === false) return true;
+  if (connection.apiKey) return true;
+  return !isCatalogEquivalentConnection(connection);
+}
+
+function publicProviderConnection(connection) {
+  return {
+    id: connection.id,
+    name: connection.name,
+    description: connection.description,
+    baseURL: connection.baseURL,
+    models: connection.models,
+    enabled: connection.enabled !== false,
+    authType: connection.authType,
+    apiKeyEnv: connection.apiKeyEnv,
+    apiKeySet: Boolean(connection.apiKey),
+    connected: isProviderConnected(connection),
+    builtin: Boolean(connection.builtin),
+    popular: Boolean(connection.popular),
+    custom: Boolean(connection.custom),
+    requiresBaseURL: Boolean(connection.requiresBaseURL),
+    updatedAtMs: connection.updatedAtMs,
+  };
+}
+
+async function listProviderConnections() {
+  return (await readProviderConnections()).map(publicProviderConnection);
+}
+
+async function saveProviderConnection(input) {
+  const connections = await readProviderConnections();
+  const id = normalizeProviderId(input.id);
+  const index = connections.findIndex((connection) => connection.id === id);
+  const next = normalizeProviderConnection(input, index >= 0 ? connections[index] : undefined);
+  if (next.enabled !== false && next.requiresBaseURL && !next.baseURL) {
+    throw new Error(`${next.name} requires a base URL.`);
+  }
+  if (index >= 0) connections[index] = next;
+  else connections.push(next);
+  await writeProviderConnections(connections);
+  return publicProviderConnection(next);
+}
+
+async function deleteProviderConnection(idValue) {
+  const id = normalizeProviderId(idValue);
+  const connections = await readProviderConnections();
+  const catalog = providerCatalogById();
+  const next = connections
+    .map((connection) => connection.id === id && catalog.has(id)
+      ? normalizeProviderConnection({ ...catalog.get(id), enabled: false })
+      : connection)
+    .filter((connection) => connection.id !== id || catalog.has(id));
+  await writeProviderConnections(next);
+  return true;
+}
+
+function providerConnectionToConfig(connection) {
+  if (!isProviderConnected(connection)) return undefined;
+  if (!connection.baseURL && !connection.builtin) return undefined;
+  const model = connection.models?.[0] ?? "custom-model";
+  return {
+    name: connection.name,
+    ...(connection.baseURL ? { baseURL: connection.baseURL } : {}),
+    model,
+    protocol: "openai-chat-completions",
+    auth: {
+      type: "api-key",
+      envKeys: connection.apiKeyEnv?.length ? connection.apiKeyEnv : [providerEnvKey(connection.id)],
+      ...(connection.apiKey ? { token: connection.apiKey } : {}),
+    },
+  };
+}
+
+async function loadProviderConnectionRuntimeConfig() {
+  const connections = await readProviderConnections();
+  const providers = {};
+  for (const connection of connections) {
+    const config = providerConnectionToConfig(connection);
+    if (config) providers[connection.id] = config;
+  }
+  return { connections, providers };
+}
+
+function findProviderIdForModel(modelName, connections) {
+  const target = String(modelName).trim().toLowerCase();
+  return connections.find((connection) =>
+    isProviderConnected(connection) && connection.models?.some((model) => String(model).trim().toLowerCase() === target)
+  )?.id;
+}
+
 async function listWorkspace() {
   const store = new LocalThreadStore(workspaceRoot);
   const summaries = await store.listThreadSummaries({ limit: 50 }).catch(() => []);
@@ -521,16 +848,15 @@ async function listWorkspace() {
       title: summary.metadata.title,
       name: summary.metadata.title,
     })),
-    modelGroups: modelGroups(),
+    modelGroups: await modelGroups(),
   };
 }
 
-function modelGroups() {
-  return [
-    { provider: "MiniMax China Token Plan", models: ["MiniMax-M3"] },
-    { provider: "DeepSeek", models: ["deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"] },
-    { provider: "OpenAI API", models: ["gpt-5.5", "gpt-5", "gpt-4.1"] },
-  ];
+async function modelGroups() {
+  const connections = await readProviderConnections();
+  return connections
+    .filter((connection) => isProviderConnected(connection) && Array.isArray(connection.models) && connection.models.length > 0)
+    .map((connection) => ({ provider: connection.name, models: connection.models }));
 }
 
 function heartbeatTaskFromSchedule(schedule) {
@@ -867,7 +1193,25 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && pathname === "/api/models") {
-    sendJson(res, 200, { modelGroups: modelGroups() });
+    sendJson(res, 200, { modelGroups: await modelGroups() });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/providers/connections") {
+    sendJson(res, 200, { providers: await listProviderConnections() });
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/providers/connections") {
+    const body = await readJson(req);
+    sendJson(res, 200, { provider: await saveProviderConnection(body) });
+    return;
+  }
+
+  const providerDeleteMatch = pathname.match(/^\/api\/providers\/connections\/([^/]+)$/);
+  if (providerDeleteMatch && req.method === "DELETE") {
+    await deleteProviderConnection(decodeURIComponent(providerDeleteMatch[1]));
+    sendJson(res, 200, { ok: true });
     return;
   }
 
