@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "approvalPolicy": "on-request",
+    "sandboxMode": "workspace-write",
+    "approvalsReviewer": "user"
+  },
+  "gateway": {
+    "enabled": true,
+    "heartbeatIntervalMs": 5000
+  },
+  "mcpServers": {
+    "dingxu_human_gui": {
+      "command": "node",
+      "args": [
+        "backend/scripts/start-human-gui-mcp.mjs"
+      ],
+      "startupTimeoutSec": 60
+    }
+  }
+}

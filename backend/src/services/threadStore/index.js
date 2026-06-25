@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { previewText } from '../events/index.js';
 const THREADS_DIR = '.pandoshare/threads';
@@ -9,6 +9,7 @@ const MESSAGES_FILE = 'messages.jsonl';
 const CHECKPOINTS_FILE = 'checkpoints.jsonl';
 const COMPACTIONS_FILE = 'compactions.jsonl';
 const RUNS_FILE = 'runs.jsonl';
+const GOAL_FILE = 'goal.json';
 export class LocalThreadStore {
     workspaceRoot;
     root;
@@ -96,6 +97,7 @@ export class LocalThreadStore {
         const events = await this.readEvents(threadId);
         const checkpoints = await this.readCheckpoints(threadId);
         const compactions = await this.readCompactions(threadId);
+        const goal = await this.readThreadGoal(threadId);
         return {
             metadata,
             messageCount: messages.length,
@@ -104,6 +106,7 @@ export class LocalThreadStore {
             compactionCount: compactions.length,
             lastCheckpoint: checkpoints[checkpoints.length - 1],
             latestCompaction: latestSuccessfulCompaction(compactions),
+            goal,
         };
     }
     async renameThread(threadId, title) {
@@ -151,11 +154,84 @@ export class LocalThreadStore {
     async readThreadExport(threadId) {
         return {
             metadata: await this.readMetadata(threadId),
+            goal: await this.readThreadGoal(threadId),
             messages: await this.readMessages(threadId),
             events: await this.readEvents(threadId),
             checkpoints: await this.readCheckpoints(threadId),
             compactions: await this.readCompactions(threadId),
         };
+    }
+    async readThreadGoal(threadId) {
+        const filePath = this.filePath(threadId, GOAL_FILE);
+        if (!(await exists(filePath)))
+            return undefined;
+        return normalizeThreadGoal(JSON.parse(await readFile(filePath, 'utf8')), threadId);
+    }
+    async setThreadGoal(threadId, input = {}) {
+        const metadata = await this.readMetadata(threadId);
+        const existing = await this.readThreadGoal(threadId);
+        const nowMs = Date.now();
+        const nowSeconds = Math.floor(nowMs / 1000);
+        const objective = typeof input.objective === 'string' && input.objective.trim()
+            ? input.objective.trim()
+            : existing?.objective;
+        if (!objective)
+            throw new Error('Goal objective must not be empty');
+        const rawTokenBudget = input.tokenBudget ?? existing?.tokenBudget;
+        const tokenBudget = rawTokenBudget === undefined || rawTokenBudget === null
+            ? undefined
+            : Math.max(0, Math.floor(Number(rawTokenBudget)));
+        const tokensUsed = Math.max(0, Math.floor(Number(input.tokensUsed ?? existing?.tokensUsed ?? 0)));
+        const timeUsedSeconds = Math.max(0, Math.floor(Number(input.timeUsedSeconds ?? existing?.timeUsedSeconds ?? 0)));
+        const requestedStatus = normalizeGoalStatus(input.status ?? existing?.status ?? 'active');
+        const status = requestedStatus === 'active' && tokenBudget !== undefined && tokensUsed >= tokenBudget
+            ? 'budgetLimited'
+            : requestedStatus;
+        const goal = {
+            goalId: existing?.goalId ?? `goal_${nowMs}_${shortId()}`,
+            threadId,
+            objective,
+            status,
+            tokenBudget,
+            tokensUsed,
+            timeUsedSeconds,
+            createdAt: existing?.createdAt ?? nowSeconds,
+            updatedAt: nowSeconds,
+        };
+        await writeJsonFile(this.filePath(threadId, GOAL_FILE), goal);
+        await this.writeMetadata({
+            ...metadata,
+            goalId: goal.goalId,
+            updatedAtMs: nowMs,
+        });
+        return goal;
+    }
+    async clearThreadGoal(threadId) {
+        const metadata = await this.readMetadata(threadId);
+        const existing = await this.readThreadGoal(threadId);
+        if (!existing)
+            return undefined;
+        await rm(this.filePath(threadId, GOAL_FILE), { force: true });
+        await this.writeMetadata({
+            ...metadata,
+            goalId: undefined,
+            updatedAtMs: Date.now(),
+        });
+        return existing;
+    }
+    async accountThreadGoalUsage(threadId, input = {}) {
+        const existing = await this.readThreadGoal(threadId);
+        if (!existing || existing.status !== 'active')
+            return existing;
+        const tokenDelta = Math.max(0, Math.floor(Number(input.tokenDelta ?? 0)));
+        const timeDeltaSeconds = Math.max(0, Math.floor(Number(input.timeDeltaSeconds ?? 0)));
+        if (tokenDelta === 0 && timeDeltaSeconds === 0)
+            return existing;
+        return this.setThreadGoal(threadId, {
+            ...existing,
+            tokensUsed: existing.tokensUsed + tokenDelta,
+            timeUsedSeconds: existing.timeUsedSeconds + timeDeltaSeconds,
+        });
     }
     async appendEvent(threadId, event) {
         await appendJsonLine(this.filePath(threadId, EVENTS_FILE), event);
@@ -264,6 +340,39 @@ export class LocalThreadStore {
             ...metadata,
             updatedAtMs: Date.now(),
         });
+    }
+}
+function normalizeThreadGoal(value, fallbackThreadId) {
+    const status = normalizeGoalStatus(value.status);
+    return {
+        goalId: typeof value.goalId === 'string' ? value.goalId : `goal_${Date.now()}_${shortId()}`,
+        threadId: typeof value.threadId === 'string' ? value.threadId : fallbackThreadId,
+        objective: typeof value.objective === 'string' ? value.objective : '',
+        status,
+        tokenBudget: value.tokenBudget === undefined || value.tokenBudget === null ? undefined : Math.max(0, Math.floor(Number(value.tokenBudget))),
+        tokensUsed: Math.max(0, Math.floor(Number(value.tokensUsed ?? 0))),
+        timeUsedSeconds: Math.max(0, Math.floor(Number(value.timeUsedSeconds ?? 0))),
+        createdAt: Math.max(0, Math.floor(Number(value.createdAt ?? Date.now() / 1000))),
+        updatedAt: Math.max(0, Math.floor(Number(value.updatedAt ?? Date.now() / 1000))),
+    };
+}
+function normalizeGoalStatus(value) {
+    switch (value) {
+        case 'active':
+        case 'paused':
+        case 'blocked':
+        case 'usageLimited':
+        case 'budgetLimited':
+        case 'complete':
+            return value;
+        case 'completed':
+            return 'complete';
+        case 'usage_limited':
+            return 'usageLimited';
+        case 'budget_limited':
+            return 'budgetLimited';
+        default:
+            return 'active';
     }
 }
 export function modelMetadata(model) {

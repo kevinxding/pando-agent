@@ -51,7 +51,6 @@ export async function authorizeToolUse(tool, toolUse, context) {
         };
     }
     const request = buildApprovalRequest(tool, toolUse, permissions);
-    await emitApprovalRequested(context, request);
     if (!wantsApprovalRequest(tool, permissions)) {
         await emitApprovalCompleted(context, request, false, 'sandbox', `Tool ${tool.name} is blocked by ${permissions.sandboxMode} and approval policy ${permissions.approvalPolicy}.`);
         return {
@@ -74,6 +73,7 @@ export async function authorizeToolUse(tool, toolUse, context) {
             };
         }
     }
+    await emitApprovalRequested(context, request);
     if (!context.requestToolApproval) {
         await emitApprovalCompleted(context, request, false, request.approvalsReviewer, `Tool ${tool.name} requires approval: ${request.reason}`);
         return {
@@ -199,10 +199,10 @@ function approvalRisk(safety) {
     }
 }
 function autoReview(request, permissions) {
-    if (permissions.sandboxMode === 'workspace-write' && request.safety === 'workspace_write') {
-        return { approved: true, reason: 'workspace_write is allowed by auto_review under workspace-write.' };
+    if (permissions.approvalsReviewer === 'auto_review') {
+        return { approved: true, reason: `${request.safety} was approved by auto_review.` };
     }
-    return { approved: false, reason: 'auto_review requires user approval for high-risk tool use.' };
+    return { approved: false, reason: 'auto_review is not enabled.' };
 }
 function normalizeApprovalDecision(decision) {
     if (typeof decision === 'boolean')

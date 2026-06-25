@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createStructuredErrorResult, createTextResult } from '../../Tool.js';
-import { LocalGoalStore } from '../../services/goalStore/index.js';
+import { emitAgentEvent, eventBase } from '../../services/events/index.js';
 export const TodoWriteTool = {
     name: 'todo_write',
     description: 'Persist the current multi-step agent todo list for this thread, goal, or long-running task.',
@@ -55,11 +55,20 @@ export const TodoWriteTool = {
             };
             await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
             let goalProgressError;
-            if (goalId) {
+            if (goalId && context.threadId) {
                 const inProgress = todos.find(todo => todo.status === 'in_progress');
                 const completed = todos.filter(todo => todo.status === 'completed').length;
                 try {
-                    await new LocalGoalStore(context.cwd).appendProgress(goalId, `Todo updated: ${completed}/${todos.length} completed${inProgress ? `, current: ${inProgress.content}` : ''}.`);
+                    await emitAgentEvent(context, {
+                        ...eventBase(context, 'goal_progress'),
+                        type: 'goal_progress',
+                        threadId: context.threadId,
+                        goalId,
+                        summary: `Todo updated: ${completed}/${todos.length} completed${inProgress ? `, current: ${inProgress.content}` : ''}.`,
+                        completedTodoCount: completed,
+                        todoCount: todos.length,
+                        currentTodo: inProgress?.content,
+                    });
                 }
                 catch (error) {
                     goalProgressError = error instanceof Error ? error.message : String(error);

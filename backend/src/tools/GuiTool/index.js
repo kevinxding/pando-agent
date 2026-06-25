@@ -1,6 +1,5 @@
 import { createTextResult } from '../../Tool.js';
 import { emitAgentEvent, eventBase } from '../../services/events/index.js';
-import { LocalGoalStore } from '../../services/goalStore/index.js';
 import { runGuiAction } from '../../services/gui/index.js';
 import { GuiRuntime } from '../../core/gui/index.js';
 export const GuiTool = {
@@ -253,14 +252,16 @@ export const GuiTool = {
             audit: result.audit,
         });
         const goalId = typeof context.metadata?.goalId === 'string' ? context.metadata.goalId : undefined;
-        if (goalId && result.ok) {
-            const goalStore = new LocalGoalStore(context.cwd);
-            await goalStore.appendEvidence(goalId, {
-                type: 'gui',
+        if (goalId && context.threadId && result.ok) {
+            await emitAgentEvent(context, {
+                ...eventBase(context, 'goal_evidence'),
+                type: 'goal_evidence',
+                threadId: context.threadId,
+                goalId,
+                source: 'gui',
                 strength: 'indirect',
                 summary: `GUI action ${request.action} completed: ${result.message}`,
-                threadId: context.threadId,
-                guiActionId: toolUse.id,
+                toolUseId: toolUse.id,
                 path: result.screenshotPath ?? result.audit?.afterImagePath ?? result.audit?.annotatedImagePath ?? result.audit?.diffImagePath,
                 metadata: {
                     method: result.method,

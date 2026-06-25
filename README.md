@@ -1,4 +1,4 @@
-# Pando Agent
+﻿# Pando Agent
 
 Pando Agent is a combined frontend and backend workspace for the PandoShare agent prototype.
 
@@ -45,4 +45,6 @@ npm run check
 ## Notes
 
 Runtime data is written under `.pandoshare/` and is intentionally ignored by Git.
+The only supported repository root for development and commits is `pando-agent/`.
+When you run `npm run dev`, both frontend and backend use `pando-agent/.pandoshare/` as the single runtime data directory.
 Do not commit API keys, tokens, local logs, or generated build output.

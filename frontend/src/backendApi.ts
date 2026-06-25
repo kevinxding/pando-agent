@@ -80,13 +80,18 @@ export type ContinueGoalResult = {
   summary?: UiGoalSummary
 }
 
-export type UiGoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'completed'
+export type UiGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete'
 
 export type UiGoalSummary = {
   id: string
+  threadId?: string
+  goalId?: string
   title: string
   objective: string
   status: UiGoalStatus
+  tokenBudget?: number
+  tokensUsed?: number
+  timeUsedSeconds?: number
   progressPercent: number
   requirementCount: number
   completedRequirementCount: number
@@ -396,18 +401,11 @@ const normalizeGoalSummary = (value: unknown): UiGoalSummary | undefined => {
   }
 
   const metadata = isRecord(source.metadata) ? source.metadata : source
-  const id = asString(metadata.goalId) ?? asString(source.goalId) ?? asString(source.id)
+  const id = asString(metadata.goalId) ?? asString(source.goalId) ?? asString(source.id) ?? asString(metadata.threadId) ?? asString(source.threadId)
   const objective = asString(source.objective) ?? asString(metadata.objective) ?? asString(metadata.title)
   const title = asString(metadata.title) ?? asString(source.title) ?? objective ?? id
   const rawStatus = asString(metadata.status) ?? asString(source.status) ?? 'active'
-  const status: UiGoalStatus =
-    rawStatus === 'paused' ||
-    rawStatus === 'blocked' ||
-    rawStatus === 'usage_limited' ||
-    rawStatus === 'budget_limited' ||
-    rawStatus === 'completed'
-      ? rawStatus
-      : 'active'
+  const status = normalizeGoalStatus(rawStatus)
 
   if (!id || !title || !objective) {
     return undefined
@@ -415,14 +413,38 @@ const normalizeGoalSummary = (value: unknown): UiGoalSummary | undefined => {
 
   return {
     id,
+    threadId: asString(metadata.threadId) ?? asString(source.threadId),
+    goalId: asString(metadata.goalId) ?? asString(source.goalId) ?? id,
     title,
     objective,
     status,
+    tokenBudget: asNumber(metadata.tokenBudget) ?? asNumber(source.tokenBudget),
+    tokensUsed: asNumber(metadata.tokensUsed) ?? asNumber(source.tokensUsed),
+    timeUsedSeconds: asNumber(metadata.timeUsedSeconds) ?? asNumber(source.timeUsedSeconds),
     progressPercent: asNumber(metadata.progressPercent) ?? asNumber(source.progressPercent) ?? 0,
     requirementCount: asNumber(source.requirementCount) ?? asNumber(metadata.requirementCount) ?? 0,
     completedRequirementCount: asNumber(metadata.completedRequirementCount) ?? 0,
     blockerCount: asNumber(metadata.blockerCount) ?? 0,
     updatedAtMs: asNumber(metadata.updatedAtMs),
+  }
+}
+
+const normalizeGoalStatus = (status: string): UiGoalStatus => {
+  switch (status) {
+    case 'paused':
+    case 'blocked':
+    case 'usageLimited':
+    case 'budgetLimited':
+    case 'complete':
+      return status
+    case 'usage_limited':
+      return 'usageLimited'
+    case 'budget_limited':
+      return 'budgetLimited'
+    case 'completed':
+      return 'complete'
+    default:
+      return 'active'
   }
 }
 
@@ -494,14 +516,17 @@ export async function loadWorkspaceSnapshot(): Promise<WorkspaceSnapshot | undef
   return { chats: threads }
 }
 
-export async function loadActiveGoal(): Promise<UiGoalSummary | undefined> {
-  const response = await jsonRequest<unknown>('/api/goals/active')
+export async function loadThreadGoal(threadId: string): Promise<UiGoalSummary | undefined> {
+  const response = await jsonRequest<unknown>(`/api/threads/${encodeURIComponent(threadId)}/goal`)
 
   return normalizeGoalSummary(response)
 }
 
-export async function createGoal(input: { objective: string; title?: string; requirements?: string[] }): Promise<UiGoalSummary | undefined> {
-  const response = await jsonRequest<unknown>('/api/goals', {
+export async function setThreadGoal(
+  threadId: string,
+  input: { objective?: string; status?: UiGoalStatus; tokenBudget?: number },
+): Promise<UiGoalSummary | undefined> {
+  const response = await jsonRequest<unknown>(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
     method: 'POST',
     body: JSON.stringify(input),
   })
@@ -509,26 +534,18 @@ export async function createGoal(input: { objective: string; title?: string; req
   return normalizeGoalSummary(response)
 }
 
-export async function updateGoalStatus(
-  goalId: string,
-  action: 'resume' | 'pause' | 'continue' | 'block' | 'complete',
-  reason?: string,
-): Promise<UiGoalSummary | undefined> {
-  const response = await jsonRequest<unknown>(`/api/goals/${encodeURIComponent(goalId)}/${action}`, {
-    method: 'POST',
-    body: JSON.stringify(reason ? { reason } : {}),
+export async function clearThreadGoal(threadId: string): Promise<UiGoalSummary | undefined> {
+  const response = await jsonRequest<unknown>(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
+    method: 'DELETE',
   })
 
   return normalizeGoalSummary(response)
 }
 
-export async function continueGoal(goalId: string, input: { threadId?: string } = {}): Promise<ContinueGoalResult | undefined> {
-  const response = await jsonRequest<unknown>(`/api/goals/${encodeURIComponent(goalId)}/continue`, {
+export async function continueThreadGoal(threadId: string): Promise<ContinueGoalResult | undefined> {
+  const response = await jsonRequest<unknown>(`/api/threads/${encodeURIComponent(threadId)}/goal/continue`, {
     method: 'POST',
-    body: JSON.stringify({
-      threadId: input.threadId,
-      stream: true,
-    }),
+    body: JSON.stringify({ stream: true }),
   })
   const data = unwrapData(response)
   if (!isRecord(data)) {
@@ -713,16 +730,9 @@ export async function sendConversationMessage(input: SendMessageInput): Promise<
 }
 
 function approvalRequestFields(approvalMode?: string) {
-  const mode = approvalMode?.trim() ?? ''
-  const normalized = mode.toLowerCase()
+  const normalized = normalizeApprovalMode(approvalMode)
 
-  if (
-    normalized === 'auto_review' ||
-    normalized === 'auto-review' ||
-    normalized === 'auto-approve' ||
-    mode.includes('替我') ||
-    mode.includes('鏇挎垜')
-  ) {
+  if (normalized === 'auto_review') {
     return {
       approvalMode: 'auto_review',
       approvalPolicy: 'on-request',
@@ -731,17 +741,7 @@ function approvalRequestFields(approvalMode?: string) {
     }
   }
 
-  if (
-    normalized === 'full_access' ||
-    normalized === 'full-access' ||
-    normalized === 'danger-full-access' ||
-    normalized.includes('full') ||
-    normalized.includes('danger') ||
-    mode.includes('完全') ||
-    mode.includes('访问') ||
-    mode.includes('瀹屽叏') ||
-    mode.includes('璁块棶')
-  ) {
+  if (normalized === 'full_access') {
     return {
       approvalMode: 'full_access',
       approvalPolicy: 'never',
@@ -756,6 +756,21 @@ function approvalRequestFields(approvalMode?: string) {
     approvalsReviewer: 'user',
     sandboxMode: 'workspace-write',
   }
+}
+
+function normalizeApprovalMode(approvalMode?: string) {
+  const mode = approvalMode?.trim() ?? ''
+  const normalized = mode.toLowerCase().replace(/[\s_]+/g, '-')
+
+  if (['auto-review', 'auto-approve', 'auto'].includes(normalized)) {
+    return 'auto_review'
+  }
+
+  if (['full-access', 'danger-full-access', 'full', 'trusted'].includes(normalized)) {
+    return 'full_access'
+  }
+
+  return 'request_approval'
 }
 export function streamRun(
   threadId: string,

@@ -7,10 +7,12 @@
     "dev": "node frontend/scripts/start-dev.mjs",
     "dev:backend": "npm --prefix backend run dev",
     "dev:api": "npm --prefix backend run dev",
+    "dev:gateway": "npm --prefix backend run dev:gateway",
     "dev:frontend": "npm --prefix frontend run dev:ui",
     "build": "npm --prefix frontend run build",
     "check": "npm run check:backend && npm run build",
-    "check:backend": "node --check backend/src/server/index.js",
-    "lint": "npm --prefix frontend run lint"
+    "check:backend": "npm --prefix backend run check",
+    "lint": "npm --prefix frontend run lint",
+    "goal:smoke": "node backend/scripts/thread-goal-smoke.mjs"
   }
 }

@@ -65,13 +65,12 @@ import {
 } from 'lucide-react'
 import './App.css'
 import {
+  clearThreadGoal,
   createConversation,
-  continueGoal,
-  createGoal,
+  continueThreadGoal,
   createProject,
   createScheduledTask,
   deleteScheduledTask,
-  loadActiveGoal,
   loadConversationEvents,
   loadConversationMessages,
   loadHeartbeatSnapshot,
@@ -84,9 +83,10 @@ import {
   sendConversationMessage,
   setHeartbeatRunning as setHeartbeatRunningBackend,
   setPinnedItem,
+  setThreadGoal,
   streamRun,
   unsetPinnedItem,
-  updateGoalStatus,
+  loadThreadGoal,
   type AgentRunEvent,
   type ApprovalDecision,
   type HeartbeatTaskInput,
@@ -210,10 +210,14 @@ type ContextUsage = {
 
 type AttachedGoal = {
   goalId?: string
+  threadId?: string
   text: string
   paused: boolean
   progressPercent?: number
   status?: string
+  tokenBudget?: number
+  tokensUsed?: number
+  timeUsedSeconds?: number
 }
 
 type PendingApprovalStatus = 'pending' | 'submitting' | 'approved' | 'rejected' | 'failed'
@@ -234,11 +238,15 @@ type PendingApprovalItem = {
 }
 
 const goalSummaryToAttachedGoal = (goal: UiGoalSummary): AttachedGoal => ({
-  goalId: goal.id,
+  goalId: goal.goalId ?? goal.id,
+  threadId: goal.threadId,
   text: goal.objective || goal.title,
   paused: goal.status !== 'active',
   progressPercent: goal.progressPercent,
   status: goal.status,
+  tokenBudget: goal.tokenBudget,
+  tokensUsed: goal.tokensUsed,
+  timeUsedSeconds: goal.timeUsedSeconds,
 })
 
 const quickActions: NavItem[] = [
@@ -383,7 +391,15 @@ const rightTools: NavItem[] = [
   { label: '侧边聊天', icon: MessagesSquare },
 ]
 
-const approvalModes = ['请求批准', '替我审批', '完全访问权限']
+const approvalModes = [
+  { id: 'request_approval', label: '\u8bf7\u6c42\u6279\u51c6' },
+  { id: 'auto_review', label: '\u66ff\u6211\u5ba1\u6279' },
+  { id: 'full_access', label: '\u5b8c\u5168\u8bbf\u95ee\u6743\u9650' },
+] as const
+
+const defaultApprovalMode = approvalModes[0].id
+const approvalModeLabel = (modeId: string) =>
+  approvalModes.find((mode) => mode.id === modeId)?.label ?? approvalModes[0].label
 
 type ModelGroup = {
   provider: string
@@ -809,7 +825,7 @@ function ProjectBlock({
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.16 }}
           >
-            {project.chats.map((chat) => (
+            {project.chats.map((chat, chatIndex) => (
               <NestedChatRow
                 chat={chat.name}
                 pinned={chat.pinned}
@@ -817,7 +833,7 @@ function ProjectBlock({
                 active={activeChatId === getProjectChatId(project.name, chat.id ?? chat.name)}
                 onOpenChat={() => onOpenChat(createProjectActiveChat(project.name, chat.name, chat.id, project.id))}
                 onTogglePin={() => onToggleChatPin(project.name, chat.name)}
-                key={`${project.name}:${chat.name}`}
+                key={`${project.id ?? project.name}:${chat.id ?? chat.name}:${chatIndex}`}
               />
             ))}
           </motion.div>
@@ -1253,7 +1269,7 @@ function LeftSidebar({
               >
                 {projectItems
                   .filter((project) => !isGlobalPinned('project', project.name, project.id))
-                  .map((project) => (
+                  .map((project, projectIndex) => (
                     <ProjectBlock
                       project={project}
                       isPinned={isGlobalPinned('project', project.name, project.id)}
@@ -1262,7 +1278,7 @@ function LeftSidebar({
                       onCreateChat={createProjectChat}
                       onTogglePin={() => toggleGlobalPin('project', project.name, project.id)}
                       onToggleChatPin={toggleProjectChatPin}
-                      key={project.name}
+                      key={`${project.id ?? project.name}:${projectIndex}`}
                     />
                   ))}
               </motion.div>
@@ -1289,7 +1305,7 @@ function LeftSidebar({
               >
                 {chatItems
                   .filter((chat) => !isGlobalPinned('chat', chat, globalChatIds[chat]))
-                  .map((chat) => (
+                  .map((chat, chatIndex) => (
                     <SidebarChatRow
                       chat={chat}
                       pinned={isGlobalPinned('chat', chat, globalChatIds[chat])}
@@ -1297,7 +1313,7 @@ function LeftSidebar({
                       onOpenChat={() => onOpenChat(createSidebarActiveChat(chat, globalChatIds[chat]))}
                       onTogglePin={() => toggleGlobalPin('chat', chat, globalChatIds[chat])}
                       onCreateChat={createSidebarChat}
-                      key={chat}
+                      key={`${globalChatIds[chat] ?? chat}:${chatIndex}`}
                     />
                   ))}
               </motion.div>
@@ -1553,8 +1569,8 @@ function ApprovalMenu({
           transition={{ duration: 0.16 }}
         >
           {approvalModes.map((mode) => (
-            <button type="button" className="approval-option" key={mode} onClick={() => onModeChange(mode)}>
-              {mode}
+            <button type="button" className="approval-option" key={mode.id} onClick={() => onModeChange(mode.id)}>
+              {mode.label}
             </button>
           ))}
         </motion.div>
@@ -2098,6 +2114,43 @@ const getApprovalStatus = (event: AgentRunEvent): ActivityStatus => {
 
   if (decision === 'reject' || approved === false) return 'rejected'
   return 'approved'
+}
+
+const normalizeGoalEventSummary = (event: AgentRunEvent): UiGoalSummary | undefined => {
+  const goal = agentEventRecord(event, 'goal')
+  if (!goal) return undefined
+  const id = agentEventString(goal, 'goalId') ?? agentEventString(goal, 'id') ?? agentEventString(goal, 'threadId')
+  const objective = agentEventString(goal, 'objective') ?? agentEventString(goal, 'title')
+  const title = agentEventString(goal, 'title') ?? objective ?? id
+  if (!id || !objective || !title) return undefined
+  const rawStatus = agentEventString(goal, 'status') ?? 'active'
+  const status =
+    rawStatus === 'paused' || rawStatus === 'blocked' || rawStatus === 'usageLimited' || rawStatus === 'budgetLimited' || rawStatus === 'complete'
+      ? rawStatus
+      : rawStatus === 'usage_limited'
+        ? 'usageLimited'
+        : rawStatus === 'budget_limited'
+          ? 'budgetLimited'
+          : rawStatus === 'completed'
+            ? 'complete'
+            : 'active'
+
+  return {
+    id,
+    goalId: agentEventString(goal, 'goalId') ?? id,
+    threadId: agentEventString(goal, 'threadId'),
+    title,
+    objective,
+    status,
+    tokenBudget: agentEventNumber(goal, 'tokenBudget'),
+    tokensUsed: agentEventNumber(goal, 'tokensUsed'),
+    timeUsedSeconds: agentEventNumber(goal, 'timeUsedSeconds'),
+    progressPercent: agentEventNumber(goal, 'progressPercent') ?? 0,
+    requirementCount: agentEventNumber(goal, 'requirementCount') ?? 0,
+    completedRequirementCount: agentEventNumber(goal, 'completedRequirementCount') ?? 0,
+    blockerCount: agentEventNumber(goal, 'blockerCount') ?? 0,
+    updatedAtMs: agentEventNumber(goal, 'updatedAtMs'),
+  }
 }
 
 const normalizeActivityPart = (event: AgentRunEvent, sequence: number): ActivityPart | null => {
@@ -3047,7 +3100,7 @@ function Composer({
 }) {
   const [attachOpen, setAttachOpen] = useState(false)
   const [approvalOpen, setApprovalOpen] = useState(false)
-  const [approvalMode, setApprovalMode] = useState('请求批准')
+  const [approvalMode, setApprovalMode] = useState<string>(defaultApprovalMode)
   const [modelOpen, setModelOpen] = useState(false)
   const [providerDialogOpen, setProviderDialogOpen] = useState(false)
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
@@ -3390,7 +3443,7 @@ function Composer({
               }}
             >
               <Gauge size={14} />
-              <span>{approvalMode}</span>
+              <span>{approvalModeLabel(approvalMode)}</span>
               <ChevronDown size={13} />
             </button>
             <ApprovalMenu
@@ -3499,7 +3552,14 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
   useEffect(() => {
     let active = true
 
-    void loadActiveGoal().then((goalSummary) => {
+    if (!activeConversationId) {
+      setAttachedGoal(null)
+      return () => {
+        active = false
+      }
+    }
+
+    void loadThreadGoal(activeConversationId).then((goalSummary) => {
       if (active) {
         setAttachedGoal(goalSummary ? goalSummaryToAttachedGoal(goalSummary) : null)
       }
@@ -3508,7 +3568,7 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
     return () => {
       active = false
     }
-  }, [])
+  }, [activeConversationId])
 
   useEffect(() => {
     let active = true
@@ -3785,6 +3845,22 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
 
     const type = getAgentRunEventType(event)
 
+    if (type === 'goal_updated') {
+      const goalSummary = normalizeGoalEventSummary(event)
+      if (goalSummary && (!activeConversationId || goalSummary.threadId === activeConversationId)) {
+        setAttachedGoal(goalSummaryToAttachedGoal(goalSummary))
+      }
+      return
+    }
+
+    if (type === 'goal_cleared') {
+      const goalSummary = normalizeGoalEventSummary(event)
+      if (!goalSummary?.threadId || !activeConversationId || goalSummary.threadId === activeConversationId) {
+        setAttachedGoal(null)
+      }
+      return
+    }
+
     if (type === 'thread_title_updated') {
       const threadId = agentEventString(event, 'threadId')
       const title = agentEventString(event, 'title')
@@ -3889,12 +3965,12 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
   }
 
   const handleCreateGoal = async (objective: string) => {
-    const currentGoal = attachedGoal
-    if (currentGoal?.goalId && !currentGoal.paused) {
-      await updateGoalStatus(currentGoal.goalId, 'pause')
+    const conversationId = await ensureConversationId()
+    if (!conversationId) {
+      return false
     }
 
-    const summary = await createGoal({ objective, title: objective })
+    const summary = await setThreadGoal(conversationId, { objective, status: 'active' })
     if (!summary) {
       return false
     }
@@ -3905,16 +3981,12 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
 
   const handleToggleGoalPaused = async () => {
     const currentGoal = attachedGoal
-    if (!currentGoal) {
+    const threadId = currentGoal?.threadId ?? activeConversationId
+    if (!currentGoal || !threadId) {
       return
     }
 
-    if (!currentGoal.goalId) {
-      setAttachedGoal({ ...currentGoal, paused: !currentGoal.paused })
-      return
-    }
-
-    const summary = await updateGoalStatus(currentGoal.goalId, currentGoal.paused ? 'resume' : 'pause')
+    const summary = await setThreadGoal(threadId, { status: currentGoal.paused ? 'active' : 'paused' })
     if (summary) {
       setAttachedGoal(goalSummaryToAttachedGoal(summary))
     }
@@ -3922,34 +3994,29 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
 
   const handleContinueGoal = async () => {
     const currentGoal = attachedGoal
-    if (!currentGoal?.goalId || currentGoal.paused) {
+    if (!currentGoal || currentGoal.paused) {
       return
     }
 
-    const conversationId = await ensureConversationId()
+    const conversationId = currentGoal.threadId ?? (await ensureConversationId())
     if (!conversationId) {
       return
     }
 
-    const time = formatMessageTime()
-    const userId = Date.now()
-    const assistantId = userId + 1
-    const userText = `继续目标：${currentGoal.text}`
-
+    const assistantId = Date.now() + 1
     setMessagesByChat((currentMessagesByChat) => {
       const currentMessages = currentMessagesByChat[activeChat.id] ?? initialMessages
       return {
         ...currentMessagesByChat,
         [activeChat.id]: [
           ...currentMessages,
-          { id: userId, role: 'user', text: userText, time },
-          { id: assistantId, role: 'assistant', text: assistantThinkingText, time, activities: [], timelineParts: [], streaming: true },
+          { id: assistantId, role: 'assistant', text: assistantThinkingText, time: formatMessageTime(), activities: [], timelineParts: [], streaming: true },
         ],
       }
     })
 
     try {
-      const result = await continueGoal(currentGoal.goalId, { threadId: conversationId })
+      const result = await continueThreadGoal(conversationId)
       if (!result?.runId) {
         updateAssistantMessage(assistantId, backendUnavailableReply)
         return
@@ -3967,7 +4034,7 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
         onEvent: (event) => handleRunEvent(event, assistantId),
         onDone: () => {
           completeSmoothAssistantText(assistantId)
-          void loadActiveGoal().then((goalSummary) => {
+          void loadThreadGoal(conversationId).then((goalSummary) => {
             setAttachedGoal(goalSummary ? goalSummaryToAttachedGoal(goalSummary) : null)
           })
         },
@@ -3984,9 +4051,9 @@ function MainChat({ activeChat, onChatTitleUpdate }: { activeChat: ActiveChat; o
   }
 
   const handleClearGoal = async () => {
-    const currentGoal = attachedGoal
-    if (currentGoal?.goalId && !currentGoal.paused) {
-      await updateGoalStatus(currentGoal.goalId, 'pause')
+    const threadId = attachedGoal?.threadId ?? activeConversationId
+    if (threadId) {
+      await clearThreadGoal(threadId)
     }
     setAttachedGoal(null)
   }

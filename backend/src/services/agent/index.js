@@ -41,10 +41,13 @@ export class AgentSession {
         const tools = input.toolRegistry ? toolSpecsForRegistry(input.toolRegistry) : undefined;
         const toolResults = [];
         const toolCalls = [];
-        const maxToolRounds = input.toolRegistry && input.toolContext ? (input.maxToolRounds ?? 4) : 0;
+        const maxToolRounds = normalizeMaxToolRounds(input.maxToolRounds);
+        const maxAutoContinuationRounds = normalizeAutoContinuationRounds(input.maxAutoContinuationRounds);
         let response;
         let nextPrompt = prompt;
+        let persistNextPrompt = true;
         let rounds = 0;
+        let autoContinuationRounds = 0;
         try {
             while (true) {
                 const round = rounds + 1;
@@ -94,8 +97,10 @@ export class AgentSession {
                 });
                 response = modelResult.response;
                 if (nextPrompt !== undefined) {
-                    this.messages.push({ role: 'user', content: nextPrompt });
+                    if (persistNextPrompt)
+                        this.messages.push({ role: 'user', content: nextPrompt });
                     nextPrompt = undefined;
+                    persistNextPrompt = true;
                 }
                 const responseToolCalls = [...(response.toolCalls ?? [])];
                 await emitAgentEvent(input.toolContext, {
@@ -128,9 +133,15 @@ export class AgentSession {
                     content: response.text,
                     toolCalls: responseToolCalls.length ? responseToolCalls : undefined,
                 });
+                if (!responseToolCalls.length && shouldAutoContinueAssistantResponse(response.text) && autoContinuationRounds < maxAutoContinuationRounds) {
+                    autoContinuationRounds += 1;
+                    nextPrompt = buildAutoContinuationPrompt(response.text);
+                    persistNextPrompt = false;
+                    continue;
+                }
                 if (!responseToolCalls.length || !input.toolRegistry || !input.toolContext)
                     break;
-                if (rounds >= maxToolRounds) {
+                if (maxToolRounds !== undefined && rounds >= maxToolRounds) {
                     const message = `Tool loop stopped after ${maxToolRounds} tool round(s).`;
                     await emitAgentEvent(input.toolContext, {
                         ...eventBase(eventContext(input, turnId), 'tool_loop_stopped'),
@@ -228,6 +239,35 @@ function toToolUse(toolCall) {
         name: toolCall.name,
         input: toolCall.input,
     };
+}
+function normalizeMaxToolRounds(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return undefined;
+    return Math.max(0, Math.floor(value));
+}
+function normalizeAutoContinuationRounds(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return 2;
+    return Math.max(0, Math.floor(value));
+}
+function shouldAutoContinueAssistantResponse(text) {
+    const normalized = String(text ?? '').trim();
+    if (normalized.length < 12 || normalized.length > 500)
+        return false;
+    if (hasDeliverableBody(normalized))
+        return false;
+    return /(?:\u4e0b\u9762|\u63a5\u4e0b\u6765|\u968f\u540e|\u73b0\u5728|\u6211\u5c06|\u6211\u4f1a|\u6211\u6765|\u8ba9\u6211|\u5f00\u59cb).{0,60}(?:\u7ed9\u51fa|\u6574\u7406|\u7ec4\u7ec7|\u751f\u6210|\u521b\u5efa|\u5199\u51fa|\u5217\u51fa|\u8f93\u51fa|\u63d0\u4f9b|\u5236\u4f5c|\u5b8c\u6210|\u7ee7\u7eed)/.test(normalized) ||
+        /(?:next|below|now|will|going to|let me).{0,80}(?:provide|generate|create|write|list|organize|output|continue|complete)/i.test(normalized);
+}
+function hasDeliverableBody(text) {
+    return /(?:\u7b2c[\u4e00-\u9fa50-9]+\u9875|Slide\s*\d+|PPT\s*\d+|^#{1,3}\s|```|\u5982\u4e0b[:\uff1a])/im.test(text);
+}
+function buildAutoContinuationPrompt(previousText) {
+    return [
+        'Your previous answer stopped after promising to continue.',
+        'Previous answer: ' + previousText,
+        'Continue now with the actual requested deliverable. Do not restate that you will do it. If tool work is required, call the needed tool; otherwise write the full result directly.',
+    ].join('\n\n');
 }
 function eventContext(input, turnId) {
     return {

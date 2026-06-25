@@ -24,6 +24,7 @@ export class QueryEngine {
     lastPersistedAgentMessageCount = 0;
     lastContextStats;
     writeAheadUserMessage;
+    activePrompt;
     initializePromise;
     inProgressToolUseIds = new Set();
     abortController;
@@ -40,10 +41,13 @@ export class QueryEngine {
             throw new Error('QueryEngine failed to initialize');
         }
         this.writeAheadUserMessage = undefined;
+        this.activePrompt = prompt;
         const run = await this.startRun(prompt);
         if (this.context)
             this.context.runId = run.runId;
-        await this.persistWriteAheadUserMessage(prompt);
+        if (this.options.persistUserMessage !== false) {
+            await this.persistWriteAheadUserMessage(prompt);
+        }
         let output;
         try {
             await this.maybeAutoCompact(prompt);
@@ -362,6 +366,24 @@ export class QueryEngine {
             approvalRequestCount: stats.approvalRequestCount,
             resourceUsage,
         });
+        await this.accountGoalProgress(run, output, now);
+    }
+    async accountGoalProgress(run, output, completedAtMs) {
+        if (!this.threadStore || !this.threadMetadata)
+            return;
+        const goal = await this.threadStore.accountThreadGoalUsage(this.threadMetadata.threadId, {
+            tokenDelta: estimateOutputTokens(output),
+            timeDeltaSeconds: Math.ceil((completedAtMs - run.startedAtMs) / 1000),
+        });
+        if (!goal)
+            return;
+        this.threadMetadata = await this.threadStore.readMetadata(this.threadMetadata.threadId);
+        await this.eventRecorder?.emitEvent({
+            ...eventBase({ sessionId: this.options.sessionId }, 'goal_updated'),
+            type: 'goal_updated',
+            threadId: this.threadMetadata.threadId,
+            goal,
+        });
     }
     async failRun(run, error) {
         if (!this.threadStore || !this.threadMetadata)
@@ -461,15 +483,27 @@ export class QueryEngine {
             return true;
         });
     }
+    filterInternalPromptMessage(messages) {
+        if (this.options.persistUserMessage !== false || !this.activePrompt)
+            return messages;
+        let dropped = false;
+        return messages.filter(message => {
+            if (!dropped && message.role === 'user' && message.content === this.activePrompt) {
+                dropped = true;
+                return false;
+            }
+            return true;
+        });
+    }
     async appendMessages(threadId, messages) {
         for (const message of messages) {
             await this.threadStore?.appendMessage(threadId, message);
         }
     }
     async persistFailedTurn(errorMessage) {
-        if (!this.threadStore || !this.threadMetadata || !this.writeAheadUserMessage)
+        if (!this.threadStore || !this.threadMetadata)
             return;
-        const newMessages = this.normalizeNewMessagesWithWriteAhead(this.agentSession?.messages.slice(this.lastPersistedAgentMessageCount) ?? []);
+        const newMessages = this.filterInternalPromptMessage(this.normalizeNewMessagesWithWriteAhead(this.agentSession?.messages.slice(this.lastPersistedAgentMessageCount) ?? []));
         const assistantMessage = {
             id: createMessageId(),
             role: 'assistant',
@@ -487,7 +521,7 @@ export class QueryEngine {
     async persistTurn(output) {
         if (!this.threadStore || !this.threadMetadata || !output.agent)
             return;
-        const newMessages = this.normalizeNewMessagesWithWriteAhead(output.agent.messages.slice(this.lastPersistedAgentMessageCount));
+        const newMessages = this.filterInternalPromptMessage(this.normalizeNewMessagesWithWriteAhead(output.agent.messages.slice(this.lastPersistedAgentMessageCount)));
         const messagesToAppend = this.messagesNotAlreadyAppended(newMessages);
         this.persistedMessages = [...this.persistedMessages, ...newMessages];
         await this.appendMessages(this.threadMetadata.threadId, messagesToAppend);
@@ -510,6 +544,21 @@ function failureAssistantContent(errorMessage) {
     if (/abort|aborted|stopped_by_user|stop/i.test(errorMessage))
         return 'Task stopped.';
     return 'Backend or model request failed. Please check Pando backend status and try again.';
+}
+function estimateOutputTokens(output) {
+    const usage = output?.usage ?? output?.response?.usage;
+    const explicit = numericUsage(usage?.totalTokens) ??
+        numericUsage(usage?.total_tokens) ??
+        numericUsage(usage?.outputTokens) ??
+        numericUsage(usage?.output_tokens) ??
+        numericUsage(usage?.completionTokens) ??
+        numericUsage(usage?.completion_tokens);
+    if (explicit !== undefined)
+        return explicit;
+    return Math.ceil(String(output?.finalText ?? '').length / 4);
+}
+function numericUsage(value) {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : undefined;
 }
 function runStats(events, output, messageCount) {
     if (output) {
